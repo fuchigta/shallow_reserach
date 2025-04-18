@@ -33,7 +33,15 @@ DEFAULT_CONCURRENCY = 3
 DEFAULT_RATE_LIMIT = 1  # リクエスト間の秒数
 MAX_RETRIES = 3
 RETRY_DELAY = 2
-DEFAULT_LLM_PROVIDER = "google"
+
+# プロバイダ設定
+LLM_PROVIDERS = ["google", "openai", "anthropic", "azure"]  # 優先順位順
+LLM_API_KEY_ENV = {
+    "google": "GOOGLE_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY"
+}
 DEFAULT_LLM_MODELS = {
     "google": "gemini-1.5-flash",
     "openai": "gpt-4-turbo-preview",
@@ -42,8 +50,25 @@ DEFAULT_LLM_MODELS = {
 }
 
 # OpenAI互換サービスのデフォルト設定
+OPENAI_ENV_VARS = {
+    "api_base": "OPENAI_API_BASE",
+    "api_version": "OPENAI_API_VERSION",
+    "deployment_name": "OPENAI_DEPLOYMENT_NAME"
+}
 DEFAULT_OPENAI_API_BASE = "https://api.openai.com/v1"  # OpenAIのデフォルトベースURL
 DEFAULT_OPENAI_API_VERSION = None  # Azure OpenAIの場合は必要
+
+def detect_available_provider() -> Optional[str]:
+    """
+    利用可能なLLMプロバイダを検出する
+    
+    Returns:
+        str: 利用可能なプロバイダ名、見つからない場合はNone
+    """
+    for provider in LLM_PROVIDERS:
+        if os.environ.get(LLM_API_KEY_ENV[provider]):
+            return provider
+    return None
 
 class LLMFactory:
     """LLMプロバイダのファクトリークラス"""
@@ -141,7 +166,7 @@ class ShallowResearcher:
         output_dir: str = DEFAULT_OUTPUT_DIR,
         concurrency: int = DEFAULT_CONCURRENCY,
         rate_limit: float = DEFAULT_RATE_LIMIT,
-        llm_provider: str = DEFAULT_LLM_PROVIDER,
+        llm_provider: Optional[str] = None,
         llm_model: Optional[str] = None,
         api_key: Optional[str] = None,
         verbose: bool = False,
@@ -156,7 +181,7 @@ class ShallowResearcher:
             output_dir: 出力ディレクトリ
             concurrency: 同時実行数
             rate_limit: リクエスト間の秒数
-            llm_provider: LLMプロバイダ ("google", "openai", "anthropic")
+            llm_provider: LLMプロバイダ。未指定の場合は利用可能なプロバイダを自動検出
             llm_model: 使用するLLMモデル（指定がない場合はプロバイダのデフォルトモデル）
             api_key: LLM APIキー
             verbose: 詳細出力モード
@@ -176,17 +201,34 @@ class ShallowResearcher:
         # コンソール出力
         self.console = Console()
         
-        # LLMの設定
-        self.llm_provider = llm_provider.lower()
-        self.llm_model = llm_model or DEFAULT_LLM_MODELS.get(self.llm_provider)
+        # LLMプロバイダの決定（自動検出または指定）
+        if llm_provider:
+            self.llm_provider = llm_provider.lower()
+            if self.llm_provider not in LLM_PROVIDERS:
+                raise ValueError(f"不明なLLMプロバイダです: {self.llm_provider}")
+        else:
+            self.llm_provider = detect_available_provider()
+            if not self.llm_provider:
+                raise ValueError("利用可能なLLMプロバイダが見つかりません。環境変数でAPIキーを設定するか、--providerオプションで指定してください。")
+            if self.verbose:
+                self.console.print(f"[cyan]LLMプロバイダを自動検出: {self.llm_provider}[/]")
         
+        # モデルの設定
+        self.llm_model = llm_model or DEFAULT_LLM_MODELS.get(self.llm_provider)
         if not self.llm_model:
             raise ValueError(f"モデルが指定されておらず、プロバイダ{self.llm_provider}のデフォルトモデルも見つかりません。")
         
         # APIキーの取得
-        api_key = api_key or os.environ.get(f"{self.llm_provider.upper()}_API_KEY")
+        api_key = api_key or os.environ.get(LLM_API_KEY_ENV[self.llm_provider])
         if not api_key:
-            raise ValueError(f"{self.llm_provider.upper()}_API_KEYが必要です。環境変数で設定するか、--api-keyオプションで指定してください。")
+            raise ValueError(f"{LLM_API_KEY_ENV[self.llm_provider]}が必要です。環境変数で設定するか、--api-keyオプションで指定してください。")
+        
+        # OpenAI互換サービスのオプションを環境変数から取得
+        for key, env_var in OPENAI_ENV_VARS.items():
+            if key not in kwargs and os.environ.get(env_var):
+                kwargs[key] = os.environ[env_var]
+                if self.verbose:
+                    self.console.print(f"[cyan]OpenAI互換オプション {key} を環境変数から設定: {kwargs[key]}[/]")
         
         # LLMの初期化
         try:
@@ -686,7 +728,7 @@ def main():
     parser.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY, help=f"同時実行数 (デフォルト: {DEFAULT_CONCURRENCY})")
     parser.add_argument("-r", "--rate-limit", type=float, default=DEFAULT_RATE_LIMIT, help=f"リクエスト間の秒数 (デフォルト: {DEFAULT_RATE_LIMIT})")
     parser.add_argument("-m", "--model", default=None, help="使用するLLMモデル（指定がない場合はプロバイダのデフォルトモデル）")
-    parser.add_argument("-p", "--provider", default=DEFAULT_LLM_PROVIDER, help=f"LLMプロバイダ (デフォルト: {DEFAULT_LLM_PROVIDER})")
+    parser.add_argument("-p", "--provider", default=LLM_PROVIDERS[0], help=f"LLMプロバイダ (デフォルト: {LLM_PROVIDERS[0]})")
     parser.add_argument("-k", "--api-key", help="API Key (環境変数で設定可能)")
     parser.add_argument("-v", "--verbose", action="store_true", help="詳細出力モード")
     parser.add_argument("-f", "--force", action="store_true", help="すべてのページを強制的に再実行")

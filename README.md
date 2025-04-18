@@ -13,6 +13,9 @@ ShallowResearch は、ウェブサイト（特に技術ドキュメントや API
 - **テキスト要約**: Gemini 2.0 Flash による AI 要約
 - **コード例抽出**: ページ内のコード例を抽出・保存
 - **最終レポート生成**: すべての要約を統合した最終レポートを生成（マークダウンと HTML 形式）
+- **マルチプロバイダー対応**: Google AI, OpenAI, Azure OpenAI, Anthropic
+- **API キーの設定状況から自動的にプロバイダーを選択**
+- **OpenAI 互換サービスの柔軟な設定（環境変数対応）**
 
 ## インストール
 
@@ -36,6 +39,18 @@ playwright install chromium
 python shallow_research.py https://example.com/docs
 ```
 
+API キーは環境変数またはコマンドラインオプションで設定できます。プロバイダーを指定しない場合は、利用可能な API キーから自動的に選択されます:
+
+```bash
+# 環境変数で設定（優先順位順）
+export GOOGLE_API_KEY=your_api_key    # Google AI
+export OPENAI_API_KEY=your_api_key    # OpenAI
+export ANTHROPIC_API_KEY=your_api_key # Anthropic
+export AZURE_OPENAI_API_KEY=your_api_key # Azure OpenAI
+
+python shallow_research.py https://example.com/docs  # 自動選択
+```
+
 各 LLM プロバイダーの使用例:
 
 ```bash
@@ -57,6 +72,15 @@ python shallow_research.py https://example.com/docs -p azure \
 # Anthropic Claude
 export ANTHROPIC_API_KEY=your_api_key
 python shallow_research.py https://example.com/docs -p anthropic
+```
+
+OpenAI 互換サービスの設定は、環境変数でも指定できます：
+
+```bash
+# OpenAI互換サービスの設定（環境変数）
+export OPENAI_API_BASE="https://your-api-endpoint"    # APIエンドポイント
+export OPENAI_API_VERSION="2024-02-15-preview"       # APIバージョン（Azure）
+export OPENAI_DEPLOYMENT_NAME="your-deployment-name"  # デプロイメント名（Azure）
 ```
 
 その他のオプション:
