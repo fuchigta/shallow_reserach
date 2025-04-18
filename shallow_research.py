@@ -14,13 +14,12 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import urljoin, urlparse
 
 import markdown
-from playwright.async_api import async_playwright, Page, Browser
+from playwright.async_api import async_playwright, Page
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
-from rich.markdown import Markdown
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -398,9 +397,6 @@ class ShallowResearcher:
         # 出力ディレクトリの作成
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # サイト名の取得（URLのドメイン部分）
-        site_name = urlparse(self.root_url).netloc
-        
         # 最終要約の再生成が必要かチェック
         needs_final_summary = self._should_regenerate_final_summary()
         
@@ -571,7 +567,7 @@ class ShallowResearcher:
 </body>
 </html>""")
             
-            self.console.print(f"[green]最終要約の生成完了！[/]")
+            self.console.print("[green]最終要約の生成完了！[/]")
             self.console.print(f"最終要約: {final_path}")
             self.console.print(f"HTML版: {html_path}")
             
