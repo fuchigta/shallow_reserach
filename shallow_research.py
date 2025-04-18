@@ -65,7 +65,8 @@ class ShallowResearcher:
         rate_limit: float = DEFAULT_RATE_LIMIT,
         llm_model: str = "gemini-1.5-flash",
         api_key: Optional[str] = None,
-        verbose: bool = False
+        verbose: bool = False,
+        force_rerun: bool = False  # 強制再実行オプションを追加
     ):
         """
         初期化メソッド
@@ -78,12 +79,14 @@ class ShallowResearcher:
             llm_model: 使用するLLMモデル
             api_key: LLM APIキー
             verbose: 詳細出力モード
+            force_rerun: すべてのページを強制的に再実行
         """
         self.root_url = url
         self.output_dir = Path(output_dir)
         self.concurrency = concurrency
         self.rate_limit = rate_limit
         self.verbose = verbose
+        self.force_rerun = force_rerun  # 強制再実行フラグを保存
         self.site_map = {}
         self.summaries = {}
         self.visited = set()
@@ -323,6 +326,71 @@ class ShallowResearcher:
                     else:
                         await asyncio.sleep(RETRY_DELAY)
     
+    def _load_previous_sitemap(self) -> Optional[Dict[str, str]]:
+        """前回のサイトマップを読み込む"""
+        sitemap_path = self.output_dir / "sitemap.json"
+        if sitemap_path.exists():
+            try:
+                with open(sitemap_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                if self.verbose:
+                    self.console.print(f"[yellow]警告: 前回のサイトマップの読み込みに失敗しました: {e}[/]")
+        return None
+
+    def _should_rerun_all(self, previous_sitemap: Optional[Dict[str, str]]) -> bool:
+        """すべてのページを再実行する必要があるかチェック"""
+        if self.force_rerun:
+            return True
+        
+        if not self.output_dir.exists():
+            return True
+            
+        if previous_sitemap is None:
+            return True
+            
+        # サイトマップの比較
+        return previous_sitemap != self.site_map
+
+    def _should_regenerate_final_summary(self) -> bool:
+        """最終要約の再生成が必要かチェック"""
+        final_md = self.output_dir / "final_summary.md"
+        final_html = self.output_dir / "final_summary.html"
+        
+        # いずれかのファイルが存在しない場合は再生成
+        if not final_md.exists() or not final_html.exists():
+            if self.verbose:
+                self.console.print("[yellow]最終要約ファイルが見つからないため、再生成します。[/]")
+            return True
+            
+        # ページの要約ファイルが1つでもあれば再生成可能
+        has_page_summaries = False
+        for md_file in self.output_dir.glob("page_*.md"):
+            has_page_summaries = True
+            break
+            
+        return has_page_summaries
+
+    def _get_pending_pages(self, previous_sitemap: Optional[Dict[str, str]]) -> List[str]:
+        """処理が必要なページのURLリストを取得"""
+        pending_pages = []
+        
+        for url in self.site_map:
+            page_exists = False
+            # URLからファイル名のパターンを生成
+            url_path = urlparse(url).path.replace('/', '_')
+            
+            # 対応するMarkdownファイルを探す
+            for file in self.output_dir.glob(f"page_*{url_path}.md"):
+                if file.exists():
+                    page_exists = True
+                    break
+            
+            if not page_exists:
+                pending_pages.append(url)
+        
+        return pending_pages
+
     async def process_site(self):
         """サイト全体を処理する"""
         await self.initialize()
@@ -332,6 +400,9 @@ class ShallowResearcher:
         
         # サイト名の取得（URLのドメイン部分）
         site_name = urlparse(self.root_url).netloc
+        
+        # 最終要約の再生成が必要かチェック
+        needs_final_summary = self._should_regenerate_final_summary()
         
         with Progress(
             SpinnerColumn(),
@@ -363,72 +434,118 @@ class ShallowResearcher:
                 
                 await browser.close()
             
-            # サイトマップが空の場合
-            if not self.site_map:
-                self.console.print("[red]エラー: サイトマップを抽出できませんでした。URLを確認して再試行してください。[/]")
+            # 前回のサイトマップを読み込み
+            previous_sitemap = self._load_previous_sitemap()
+            
+            # 再実行が必要かチェック
+            if self._should_rerun_all(previous_sitemap):
+                pages_to_process = list(self.site_map.keys())
+                if self.verbose:
+                    reason = "強制再実行" if self.force_rerun else "サイトマップの変更" if previous_sitemap else "初回実行"
+                    self.console.print(f"[yellow]すべてのページを処理します（理由: {reason}）[/]")
+            else:
+                pages_to_process = self._get_pending_pages(previous_sitemap)
+                if self.verbose:
+                    self.console.print(f"[yellow]未処理の{len(pages_to_process)}ページを処理します[/]")
+            
+            if not pages_to_process and not needs_final_summary:
+                self.console.print("[green]すべてのページは既に処理済みです。[/]")
                 return
             
-            # サイトマップを保存
-            sitemap_path = self.output_dir / "sitemap.json"
-            with open(sitemap_path, "w", encoding="utf-8") as f:
-                json.dump(self.site_map, f, ensure_ascii=False, indent=2)
-            
-            # 各ページの処理
-            pages_task = progress.add_task("[cyan]ページを処理中...", total=len(self.site_map))
-            tasks = []
-            
-            for url in self.site_map:
-                page_task = progress.add_task(f"待機中: {url}", total=1, visible=True)
-                task = asyncio.create_task(self.summarize_page(url, page_task, progress))
-                tasks.append((task, page_task))
-                progress.update(pages_task, advance=0)
-            
-            # すべてのタスクを実行
-            for i, (task, page_task) in enumerate(tasks):
-                result = await task
+            # ページの処理が必要な場合のみ
+            if pages_to_process:
+                # サイトマップを保存（新しいバージョンで更新）
+                sitemap_path = self.output_dir / "sitemap.json"
+                with open(sitemap_path, "w", encoding="utf-8") as f:
+                    json.dump(self.site_map, f, ensure_ascii=False, indent=2)
                 
-                # 要約を保存
-                if result:
-                    self.summaries[result["url"]] = result
-                    
-                    # ファイル名の生成（URLから安全なファイル名に変換）
-                    file_name = f"page_{i+1}_{urlparse(result['url']).path.replace('/', '_')}.md"
-                    file_name = file_name.replace(':', '_').replace('?', '_').replace('&', '_')
-                    file_path = self.output_dir / file_name
-                    
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(result["summary"])
+                # 各ページの処理
+                pages_task = progress.add_task("[cyan]ページを処理中...", total=len(pages_to_process))
+                tasks = []
                 
-                progress.update(pages_task, advance=1)
+                for url in pages_to_process:
+                    page_task = progress.add_task(f"待機中: {url}", total=1, visible=True)
+                    task = asyncio.create_task(self.summarize_page(url, page_task, progress))
+                    tasks.append((task, page_task))
+                    progress.update(pages_task, advance=0)
+                
+                # すべてのタスクを実行
+                for i, (task, page_task) in enumerate(tasks):
+                    result = await task
+                    
+                    # 要約を保存
+                    if result:
+                        self.summaries[result["url"]] = result
+                        
+                        # ファイル名の生成（URLから安全なファイル名に変換）
+                        file_name = f"page_{i+1}_{urlparse(result['url']).path.replace('/', '_')}.md"
+                        file_name = file_name.replace(':', '_').replace('?', '_').replace('&', '_')
+                        file_path = self.output_dir / file_name
+                        
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write(result["summary"])
+                    
+                    progress.update(pages_task, advance=1)
             
-            # 最終要約の作成
-            final_task = progress.add_task("[cyan]最終要約を作成中...", total=1)
-            
-            # すべての要約を連結
-            all_summaries = ""
-            for url, summary_data in self.summaries.items():
-                title = summary_data["title"]
-                url_summary = summary_data["summary"]
-                all_summaries += f"## {title}\n\n{url_summary}\n\n---\n\n"
-            
+            # 必要な場合は最終要約を生成
+            if pages_to_process or needs_final_summary:
+                final_task = progress.add_task("[cyan]最終要約を生成中...", total=1)
+                
+                try:
+                    await self.generate_final_summary()
+                    progress.update(final_task, completed=True, description="最終要約の生成完了")
+                except Exception as e:
+                    progress.update(final_task, completed=True, description=f"[red]最終要約の生成エラー: {e}[/]")
+                    raise
+        
+        # 完了
+        self.console.print(f"[green]処理完了！[/] 出力ディレクトリ: {self.output_dir}")
+        sitemap_path = self.output_dir / "sitemap.json"
+        if sitemap_path.exists():
+            self.console.print(f"サイトマップ: {sitemap_path}")
+        self.console.print(f"最終要約: {self.output_dir}/final_summary.md")
+        self.console.print(f"HTML版: {self.output_dir}/final_summary.html")
+    
+    async def generate_final_summary(self):
+        """最終要約のみを生成する"""
+        await self.initialize()
+        
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        site_name = urlparse(self.root_url).netloc
+        
+        # 既存の要約を読み込む
+        all_summaries = ""
+        for md_file in self.output_dir.glob("page_*.md"):
             try:
-                final_summary = await self.final_summary_chain.ainvoke({
-                    "site_name": site_name,
-                    "summaries": all_summaries
-                })
-                
-                # 最終要約を保存
-                final_path = self.output_dir / "final_summary.md"
-                with open(final_path, "w", encoding="utf-8") as f:
-                    f.write(final_summary)
-                
-                progress.update(final_task, completed=True, description="最終要約の作成完了")
-                
-                # HTMLバージョンも作成
-                html_content = markdown.markdown(final_summary)
-                html_path = self.output_dir / "final_summary.html"
-                with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(f"""<!DOCTYPE html>
+                with open(md_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    title = content.split("\n")[0].strip("# ")  # 最初の行からタイトルを抽出
+                    all_summaries += f"## {title}\n\n{content}\n\n---\n\n"
+            except Exception as e:
+                if self.verbose:
+                    self.console.print(f"[yellow]警告: {md_file}の読み込み中にエラー: {e}[/]")
+        
+        if not all_summaries:
+            raise ValueError("要約ファイルが見つかりません。先に全ページの要約を生成してください。")
+        
+        try:
+            final_summary = await self.final_summary_chain.ainvoke({
+                "site_name": site_name,
+                "summaries": all_summaries
+            })
+            
+            # 最終要約を保存
+            final_path = self.output_dir / "final_summary.md"
+            with open(final_path, "w", encoding="utf-8") as f:
+                f.write(final_summary)
+            
+            # HTMLバージョンも作成
+            html_content = markdown.markdown(final_summary)
+            html_path = self.output_dir / "final_summary.html"
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -453,19 +570,21 @@ class ShallowResearcher:
     </footer>
 </body>
 </html>""")
-                
-            except Exception as e:
-                progress.update(final_task, completed=True, description=f"[red]最終要約の作成エラー: {e}[/]")
-        
-        # 完了
-        self.console.print(f"[green]処理完了！[/] 出力ディレクトリ: {self.output_dir}")
-        self.console.print(f"サイトマップ: {sitemap_path}")
-        self.console.print(f"最終要約: {self.output_dir}/final_summary.md")
-        self.console.print(f"HTML版: {self.output_dir}/final_summary.html")
-    
+            
+            self.console.print(f"[green]最終要約の生成完了！[/]")
+            self.console.print(f"最終要約: {final_path}")
+            self.console.print(f"HTML版: {html_path}")
+            
+        except Exception as e:
+            raise Exception(f"最終要約の生成中にエラーが発生しました: {e}")
+
     def run(self):
         """メインの実行メソッド"""
         asyncio.run(self.process_site())
+
+    def run_final_summary(self):
+        """最終要約のみを生成するメソッド"""
+        asyncio.run(self.generate_final_summary())
 
 
 def main():
@@ -478,10 +597,12 @@ def main():
     parser.add_argument("-m", "--model", default="gemini-1.5-flash", help="使用するLLMモデル (デフォルト: gemini-1.5-flash)")
     parser.add_argument("-k", "--api-key", help="Google API Key (環境変数 GOOGLE_API_KEY でも設定可能)")
     parser.add_argument("-v", "--verbose", action="store_true", help="詳細出力モード")
-    
+    parser.add_argument("-f", "--force", action="store_true", help="すべてのページを強制的に再実行")
+    parser.add_argument("--final-only", action="store_true", help="最終要約のみを生成")
+
     args = parser.parse_args()
     
-    # 研究オブジェクトの作成と実行
+    # 研究オブジェクトの作成
     researcher = ShallowResearcher(
         url=args.url,
         output_dir=args.output,
@@ -489,11 +610,15 @@ def main():
         rate_limit=args.rate_limit,
         llm_model=args.model,
         api_key=args.api_key,
-        verbose=args.verbose
+        verbose=args.verbose,
+        force_rerun=args.force
     )
     
     try:
-        researcher.run()
+        if args.final_only:
+            researcher.run_final_summary()
+        else:
+            researcher.run()
     except KeyboardInterrupt:
         print("\n処理を中断しました。")
         sys.exit(1)
