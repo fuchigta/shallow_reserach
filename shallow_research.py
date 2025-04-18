@@ -10,14 +10,17 @@ import time
 import json
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from urllib.parse import urljoin, urlparse
 
 import markdown
 from playwright.async_api import async_playwright, Page
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.language_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
 
@@ -30,6 +33,82 @@ DEFAULT_CONCURRENCY = 3
 DEFAULT_RATE_LIMIT = 1  # リクエスト間の秒数
 MAX_RETRIES = 3
 RETRY_DELAY = 2
+DEFAULT_LLM_PROVIDER = "google"
+DEFAULT_LLM_MODELS = {
+    "google": "gemini-1.5-flash",
+    "openai": "gpt-4-turbo-preview",
+    "anthropic": "claude-3-opus-20240229",
+    "azure": "gpt-4"  # Azure OpenAIのデフォルトモデル
+}
+
+# OpenAI互換サービスのデフォルト設定
+DEFAULT_OPENAI_API_BASE = "https://api.openai.com/v1"  # OpenAIのデフォルトベースURL
+DEFAULT_OPENAI_API_VERSION = None  # Azure OpenAIの場合は必要
+
+class LLMFactory:
+    """LLMプロバイダのファクトリークラス"""
+    
+    @staticmethod
+    def create_llm(
+        provider: Literal["google", "openai", "anthropic", "azure"],
+        model: str,
+        api_key: str,
+        **kwargs
+    ) -> BaseChatModel:
+        """
+        LLMインスタンスを作成する
+        
+        Args:
+            provider: LLMプロバイダ ("google", "openai", "anthropic", "azure")
+            model: 使用するモデル名
+            api_key: APIキー
+            **kwargs: その他のオプション
+                - api_base: OpenAI互換サービスのベースURL
+                - api_version: Azure OpenAIのAPIバージョン
+                - deployment_name: Azure OpenAIのデプロイメント名
+                - temperature: 生成時の温度
+                - max_tokens: 最大トークン数
+            
+        Returns:
+            LLMインスタンス
+        """
+        if provider == "google":
+            return ChatGoogleGenerativeAI(
+                model=model,
+                google_api_key=api_key,
+                temperature=kwargs.get("temperature", 0.2),
+                max_output_tokens=kwargs.get("max_tokens", 4096),
+            )
+        elif provider in ["openai", "azure"]:
+            openai_kwargs = {
+                "model": model if provider == "openai" else None,
+                "deployment_name": kwargs.get("deployment_name") if provider == "azure" else None,
+                "temperature": kwargs.get("temperature", 0.2),
+                "max_tokens": kwargs.get("max_tokens", 4096),
+                "api_key": api_key,
+                "api_version": kwargs.get("api_version") if provider == "azure" else None,
+                "azure": provider == "azure",
+            }
+            
+            # ベースURLの設定
+            api_base = kwargs.get("api_base")
+            if api_base:
+                openai_kwargs["api_base"] = api_base
+            elif provider == "azure":
+                raise ValueError("Azure OpenAIを使用する場合は、api_baseの指定が必要です")
+            
+            return ChatOpenAI(**{k: v for k, v in openai_kwargs.items() if v is not None})
+            
+        elif provider == "anthropic":
+            return ChatAnthropic(
+                model=model,
+                api_key=api_key,
+                temperature=kwargs.get("temperature", 0.2),
+                max_tokens=kwargs.get("max_tokens", 4096),
+            )
+        else:
+            raise ValueError(f"不明なLLMプロバイダです: {provider}")
+
 SUMMARY_TEMPLATE = """
 以下のウェブページの内容を要約してください。重要なポイント、主要な概念、コード例があれば含めてください。
 マークダウン形式で返してください。
@@ -62,10 +141,12 @@ class ShallowResearcher:
         output_dir: str = DEFAULT_OUTPUT_DIR,
         concurrency: int = DEFAULT_CONCURRENCY,
         rate_limit: float = DEFAULT_RATE_LIMIT,
-        llm_model: str = "gemini-1.5-flash",
+        llm_provider: str = DEFAULT_LLM_PROVIDER,
+        llm_model: Optional[str] = None,
         api_key: Optional[str] = None,
         verbose: bool = False,
-        force_rerun: bool = False  # 強制再実行オプションを追加
+        force_rerun: bool = False,  # 強制再実行オプションを追加
+        **kwargs
     ):
         """
         初期化メソッド
@@ -75,7 +156,8 @@ class ShallowResearcher:
             output_dir: 出力ディレクトリ
             concurrency: 同時実行数
             rate_limit: リクエスト間の秒数
-            llm_model: 使用するLLMモデル
+            llm_provider: LLMプロバイダ ("google", "openai", "anthropic")
+            llm_model: 使用するLLMモデル（指定がない場合はプロバイダのデフォルトモデル）
             api_key: LLM APIキー
             verbose: 詳細出力モード
             force_rerun: すべてのページを強制的に再実行
@@ -95,16 +177,29 @@ class ShallowResearcher:
         self.console = Console()
         
         # LLMの設定
-        api_key = api_key or os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("Google APIキーが必要です。環境変数GOOGLE_API_KEYを設定するか、--api-keyオプションで指定してください。")
+        self.llm_provider = llm_provider.lower()
+        self.llm_model = llm_model or DEFAULT_LLM_MODELS.get(self.llm_provider)
         
-        self.llm = ChatGoogleGenerativeAI(
-            model=llm_model,
-            google_api_key=api_key,
-            temperature=0.2,
-            max_output_tokens=4096,
-        )
+        if not self.llm_model:
+            raise ValueError(f"モデルが指定されておらず、プロバイダ{self.llm_provider}のデフォルトモデルも見つかりません。")
+        
+        # APIキーの取得
+        api_key = api_key or os.environ.get(f"{self.llm_provider.upper()}_API_KEY")
+        if not api_key:
+            raise ValueError(f"{self.llm_provider.upper()}_API_KEYが必要です。環境変数で設定するか、--api-keyオプションで指定してください。")
+        
+        # LLMの初期化
+        try:
+            self.llm = LLMFactory.create_llm(
+                provider=self.llm_provider,
+                model=self.llm_model,
+                api_key=api_key,
+                temperature=0.2,
+                max_output_tokens=4096,
+                **kwargs
+            )
+        except Exception as e:
+            raise Exception(f"LLMの初期化に失敗しました: {e}")
         
         # チェーンの設定
         self.summary_chain = (
@@ -590,13 +685,28 @@ def main():
     parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help=f"出力ディレクトリ (デフォルト: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY, help=f"同時実行数 (デフォルト: {DEFAULT_CONCURRENCY})")
     parser.add_argument("-r", "--rate-limit", type=float, default=DEFAULT_RATE_LIMIT, help=f"リクエスト間の秒数 (デフォルト: {DEFAULT_RATE_LIMIT})")
-    parser.add_argument("-m", "--model", default="gemini-1.5-flash", help="使用するLLMモデル (デフォルト: gemini-1.5-flash)")
-    parser.add_argument("-k", "--api-key", help="Google API Key (環境変数 GOOGLE_API_KEY でも設定可能)")
+    parser.add_argument("-m", "--model", default=None, help="使用するLLMモデル（指定がない場合はプロバイダのデフォルトモデル）")
+    parser.add_argument("-p", "--provider", default=DEFAULT_LLM_PROVIDER, help=f"LLMプロバイダ (デフォルト: {DEFAULT_LLM_PROVIDER})")
+    parser.add_argument("-k", "--api-key", help="API Key (環境変数で設定可能)")
     parser.add_argument("-v", "--verbose", action="store_true", help="詳細出力モード")
     parser.add_argument("-f", "--force", action="store_true", help="すべてのページを強制的に再実行")
     parser.add_argument("--final-only", action="store_true", help="最終要約のみを生成")
+    
+    # OpenAI互換サービスのオプション
+    parser.add_argument("--api-base", help="OpenAI互換サービスのベースURL")
+    parser.add_argument("--api-version", help="Azure OpenAIのAPIバージョン")
+    parser.add_argument("--deployment-name", help="Azure OpenAIのデプロイメント名")
 
     args = parser.parse_args()
+    
+    # OpenAI互換サービスの追加設定
+    kwargs = {}
+    if args.api_base:
+        kwargs["api_base"] = args.api_base
+    if args.api_version:
+        kwargs["api_version"] = args.api_version
+    if args.deployment_name:
+        kwargs["deployment_name"] = args.deployment_name
     
     # 研究オブジェクトの作成
     researcher = ShallowResearcher(
@@ -604,10 +714,12 @@ def main():
         output_dir=args.output,
         concurrency=args.concurrency,
         rate_limit=args.rate_limit,
+        llm_provider=args.provider,
         llm_model=args.model,
         api_key=args.api_key,
         verbose=args.verbose,
-        force_rerun=args.force
+        force_rerun=args.force,
+        **kwargs  # OpenAI互換サービスの設定を追加
     )
     
     try:

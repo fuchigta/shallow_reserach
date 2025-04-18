@@ -36,15 +36,27 @@ playwright install chromium
 python shallow_research.py https://example.com/docs
 ```
 
-Google API Key の指定:
+各 LLM プロバイダーの使用例:
 
 ```bash
-# 環境変数として設定
+# Google AI (デフォルト)
 export GOOGLE_API_KEY=your_api_key
 python shallow_research.py https://example.com/docs
 
-# コマンドラインで指定
-python shallow_research.py https://example.com/docs --api-key YOUR_GOOGLE_API_KEY
+# OpenAI GPT-4
+export OPENAI_API_KEY=your_api_key
+python shallow_research.py https://example.com/docs -p openai
+
+# Azure OpenAI
+export AZURE_API_KEY=your_api_key
+python shallow_research.py https://example.com/docs -p azure \
+  --api-base "https://your-resource.openai.azure.com" \
+  --api-version "2024-02-15-preview" \
+  --deployment-name "your-deployment"
+
+# Anthropic Claude
+export ANTHROPIC_API_KEY=your_api_key
+python shallow_research.py https://example.com/docs -p anthropic
 ```
 
 その他のオプション:
@@ -57,10 +69,16 @@ python shallow_research.py https://example.com/docs -o my_research
 python shallow_research.py https://example.com/docs -c 5 -r 0.5
 
 # 異なるLLMモデルを使用
-python shallow_research.py https://example.com/docs -m gemini-1.5-pro
+python shallow_research.py https://example.com/docs -m gpt-4-turbo-preview
 
 # 詳細出力モード
 python shallow_research.py https://example.com/docs -v
+
+# すべてのページを強制的に再処理
+python shallow_research.py https://example.com/docs -f
+
+# 最終要約のみを生成
+python shallow_research.py https://example.com/docs --final-only
 ```
 
 ## 出力ファイル
@@ -74,15 +92,30 @@ python shallow_research.py https://example.com/docs -v
 
 ## コマンドラインオプション
 
-| オプション          | 説明                                                |
-| ------------------- | --------------------------------------------------- |
-| `url`               | 調査対象の URL（必須）                              |
-| `-o, --output`      | 出力ディレクトリ（デフォルト: research_output）     |
-| `-c, --concurrency` | 同時実行数（デフォルト: 3）                         |
-| `-r, --rate-limit`  | リクエスト間の待機時間（秒）（デフォルト: 1）       |
-| `-m, --model`       | 使用する LLM モデル（デフォルト: gemini-1.5-flash） |
-| `-k, --api-key`     | Google API Key                                      |
-| `-v, --verbose`     | 詳細出力モード                                      |
+| オプション          | 説明                                                  |
+| ------------------- | ----------------------------------------------------- |
+| `url`               | 調査対象の URL（必須）                                |
+| `-o, --output`      | 出力ディレクトリ（デフォルト: research_output）       |
+| `-c, --concurrency` | 同時実行数（デフォルト: 3）                           |
+| `-r, --rate-limit`  | リクエスト間の待機時間（秒）（デフォルト: 1）         |
+| `-p, --provider`    | LLM プロバイダ（google/openai/azure/anthropic）       |
+| `-m, --model`       | 使用する LLM モデル（プロバイダごとのデフォルトあり） |
+| `-k, --api-key`     | LLM プロバイダの API キー                             |
+| `-v, --verbose`     | 詳細出力モード                                        |
+| `-f, --force`       | すべてのページを強制的に再処理                        |
+| `--final-only`      | 最終要約のみを生成                                    |
+| `--api-base`        | OpenAI 互換サービスのベース URL                       |
+| `--api-version`     | Azure OpenAI の API バージョン                        |
+| `--deployment-name` | Azure OpenAI のデプロイメント名                       |
+
+## デフォルトの LLM モデル
+
+各プロバイダのデフォルトモデル:
+
+- Google AI: `gemini-1.5-flash`
+- OpenAI: `gpt-4-turbo-preview`
+- Anthropic: `claude-3-opus-20240229`
+- Azure OpenAI: `gpt-4`
 
 ## アーキテクチャ
 
