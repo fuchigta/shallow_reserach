@@ -272,14 +272,48 @@ class ShallowResearcher:
         """
         # サイドバーなどのナビゲーション要素を探す
         nav_selectors = [
+            # 標準的なナビゲーション要素
             "nav", 
-            ".sidebar", 
-            ".navigation", 
-            ".menu", 
-            "ul.nav", 
+            ".sidebar",
+            ".navigation",
+            ".menu",
+            "ul.nav",
             "[role=navigation]",
             "#sidebar",
-            ".toc"
+            ".toc",
+            
+            # ドキュメントサイト特有のセレクタ
+            ".docs-sidebar",
+            ".docs-navigation",
+            ".documentation-nav",
+            ".table-of-contents",
+            "[role=doc-toc]",
+            "[role=complementary]",
+            ".docusaurus-sidebar",
+            ".gatsby-sidebar",
+            ".nextjs-sidebar",
+            
+            # MDXやGatsbyなどで一般的に使用されるクラス
+            ".mdx-sidebar",
+            ".mdx-nav",
+            ".gatsby-nav",
+            ".gatsby-menu",
+            
+            # 一般的なサイドバーの構造を持つ要素
+            "aside",
+            "aside a",
+            ".left-sidebar",
+            ".right-sidebar",
+            ".side-nav",
+            ".side-menu",
+            
+            # より広範な検索のためのフォールバック
+            "[class*='sidebar']",
+            "[class*='navigation']",
+            "[class*='menu']",
+            "[class*='toc']",
+            "main nav",
+            "header nav"
         ]
         
         sitemap = {}
@@ -306,18 +340,56 @@ class ShallowResearcher:
         # サイトマップが空の場合、ページ内のすべてのリンクを取得するフォールバック
         if not sitemap:
             try:
-                all_links = await page.query_selector_all("a")
-                for link in all_links:
-                    href = await link.get_attribute("href")
-                    if href and not href.startswith("#") and not href.startswith("javascript:"):
-                        abs_url = urljoin(base_url, href)
-                        if urlparse(abs_url).netloc == urlparse(base_url).netloc:
-                            title = await link.text_content()
-                            title = title.strip() if title else "No Title"
-                            sitemap[abs_url] = title
+                # まずヘッダーやメインコンテンツ内のリンクを探す
+                main_link_selectors = [
+                    "header a",
+                    "main a",
+                    "article a",
+                    ".content a",
+                    "#content a",
+                    ".main-content a",
+                    ".markdown-body a",
+                    ".prose a",
+                    "[role=main] a"
+                ]
+                
+                for selector in main_link_selectors:
+                    links = await page.query_selector_all(selector)
+                    for link in links:
+                        href = await link.get_attribute("href")
+                        if href and not href.startswith("#") and not href.startswith("javascript:"):
+                            abs_url = urljoin(base_url, href)
+                            if urlparse(abs_url).netloc == urlparse(base_url).netloc:
+                                title = await link.text_content()
+                                title = title.strip() if title else "No Title"
+                                sitemap[abs_url] = title
+                
+                # まだリンクが見つからない場合は、すべてのリンクを対象にする
+                if not sitemap:
+                    all_links = await page.query_selector_all("a")
+                    for link in all_links:
+                        href = await link.get_attribute("href")
+                        if href and not href.startswith("#") and not href.startswith("javascript:"):
+                            abs_url = urljoin(base_url, href)
+                            if urlparse(abs_url).netloc == urlparse(base_url).netloc:
+                                # タイトルの抽出を改善
+                                title = await link.evaluate("el => el.getAttribute('title') || el.textContent")
+                                title = title.strip() if title else "No Title"
+                                
+                                # URLのパスからタイトルを推測（タイトルが空の場合）
+                                if title == "No Title":
+                                    path = urlparse(abs_url).path
+                                    if path:
+                                        # パスの最後の部分を取得し、ハイフンやアンダースコアを空白に変換
+                                        path_title = path.rstrip('/').split('/')[-1]
+                                        path_title = path_title.replace('-', ' ').replace('_', ' ')
+                                        path_title = ' '.join(word.capitalize() for word in path_title.split())
+                                        title = path_title
+                                
+                                sitemap[abs_url] = title
             except Exception as e:
                 if self.verbose:
-                    self.console.print(f"[yellow]警告: すべてのリンク抽出中にエラーが発生しました: {e}[/]")
+                    self.console.print(f"[yellow]警告: リンク抽出中にエラーが発生しました: {e}[/]")
         
         return sitemap
     
@@ -333,14 +405,37 @@ class ShallowResearcher:
         """
         # メインコンテンツエリアのセレクタ
         main_selectors = [
+            # 標準的なコンテンツエリア
             "main", 
             "article", 
             ".content", 
             "#content", 
             ".main-content",
+            
+            # ドキュメントサイト特有のセレクタ
             ".documentation",
             ".docs-content",
-            ".markdown-body"
+            ".markdown-body",
+            ".mdx-content",
+            ".prose",
+            "[role=main]",
+            ".main-docs-content",
+            
+            # MDXやGatsbyなどで一般的に使用されるクラス
+            ".mdx-wrapper",
+            ".gatsby-content",
+            ".docs-wrapper",
+            ".docs-container",
+            
+            # APIドキュメント特有のセレクタ
+            ".api-content",
+            ".api-documentation",
+            ".reference-content",
+            
+            # フォールバック用の広範なセレクタ
+            "[class*='content']",
+            "[class*='documentation']",
+            "[class*='markdown']"
         ]
         
         content = ""
@@ -367,22 +462,10 @@ class ShallowResearcher:
                 if self.verbose:
                     self.console.print(f"[yellow]警告: コンテンツ抽出中にエラーが発生しました: {e}[/]")
         
-        # コードブロックを探す (可能であれば)
-        code_blocks = []
-        try:
-            code_elements = await page.query_selector_all("pre code, pre, .code-block")
-            for code_elem in code_elements:
-                code_text = await code_elem.inner_text()
-                if code_text:
-                    code_blocks.append(code_text)
-        except Exception:
-            pass
-        
         return {
             "title": title,
             "url": url,
             "content": content,
-            "code_blocks": code_blocks
         }
     
     async def summarize_page(self, url: str, task_id: Optional[TaskID] = None, progress: Optional[Progress] = None) -> Dict[str, Any]:
@@ -430,13 +513,6 @@ class ShallowResearcher:
                                 "url": url,
                                 "content": page_data["content"]
                             })
-                        
-                        # コードブロックがあれば追加
-                        if page_data["code_blocks"]:
-                            code_section = "\n\n## コード例\n\n"
-                            for i, code in enumerate(page_data["code_blocks"][:3]):  # 最大3つまで
-                                code_section += f"```\n{code[:500]}...\n```\n\n"  # 長すぎる場合は切り詰める
-                            summary += code_section
                         
                         result = {
                             "title": page_data["title"],
