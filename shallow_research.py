@@ -761,6 +761,100 @@ class ShallowResearcher:
         self.console.print(f"最終要約: {self.output_dir}/final_summary.md")
         self.console.print(f"HTML版: {self.output_dir}/final_summary.html")
     
+    def _build_site_tree(self, sitemap: Dict[str, str]) -> Dict[str, Any]:
+        """
+        サイトマップからツリー構造を構築する
+        
+        Args:
+            sitemap: URL -> タイトルのマッピング
+            
+        Returns:
+            ツリー構造の辞書
+        """
+        tree = {}
+        for url, title in sitemap.items():
+            path_parts = urlparse(url).path.strip('/').split('/')
+            current = tree
+            
+            # パスの各部分をツリーに追加
+            for i, part in enumerate(path_parts):
+                if not part:
+                    continue
+                if part not in current:
+                    current[part] = {
+                        'title': title if i == len(path_parts) - 1 else part.replace('-', ' ').title(),
+                        'url': url if i == len(path_parts) - 1 else None,
+                        'children': {},
+                        'content': None,
+                        'summary': None
+                    }
+                current = current[part]['children']
+        
+        return tree
+    
+    async def _summarize_tree_node(self, node: Dict[str, Any], parent_path: str = "") -> str:
+        """
+        ツリーノードを再帰的に要約する
+        
+        Args:
+            node: ツリーノード
+            parent_path: 親ノードまでのパス
+            
+        Returns:
+            ノードの要約
+        """
+        # リーフノードの場合、コンテンツを読み込む
+        if node['url'] and not node['children']:
+            md_files = list(self.output_dir.glob(f"page_*{urlparse(node['url']).path.replace('/', '_')}.md"))
+            if md_files:
+                with open(md_files[0], "r", encoding="utf-8") as f:
+                    node['content'] = f.read()
+                    return node['content']
+            return f"# {node['title']}\n\nコンテンツが見つかりません。"
+        
+        # 子ノードの要約を収集
+        children_summaries = []
+        for child_name, child_node in node['children'].items():
+            child_path = f"{parent_path}/{child_name}" if parent_path else child_name
+            child_summary = await self._summarize_tree_node(child_node, child_path)
+            if child_summary:
+                children_summaries.append(child_summary)
+        
+        if not children_summaries:
+            return ""
+        
+        # このノードの要約を生成
+        section_chain = ChatPromptTemplate.from_template(SECTION_SUMMARY_TEMPLATE) | self.llm | StrOutputParser()
+        try:
+            node['summary'] = await section_chain.ainvoke({
+                "section_name": node['title'],
+                "summaries": "\n\n---\n\n".join(children_summaries)
+            })
+            
+            # ノードの要約をファイルに保存
+            if parent_path:
+                # 親パスがある場合はそれを含めたファイル名を生成
+                file_name = f"node_{parent_path}_{node['title']}_summary.md".lower()
+            else:
+                file_name = f"node_{node['title']}_summary.md".lower()
+                
+            # ファイル名の特殊文字を置換
+            file_name = file_name.replace('/', '_').replace(':', '_').replace('?', '_').replace('&', '_').replace(' ', '_')
+            file_path = self.output_dir / file_name
+            
+            # 要約を保存
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(f"# {node['title']}\n\n{node['summary']}")
+            
+            if self.verbose:
+                self.console.print(f"[green]ノード要約を保存: {file_path}[/]")
+            
+            return node['summary']
+        except Exception as e:
+            if self.verbose:
+                self.console.print(f"[yellow]警告: セクション {node['title']} の要約生成中にエラー: {e}[/]")
+            return "\n\n".join(children_summaries)
+
     async def generate_final_summary(self):
         """最終要約のみを生成する"""
         await self.initialize()
@@ -770,92 +864,35 @@ class ShallowResearcher:
         
         site_name = urlparse(self.root_url).netloc
         
-        # サイトマップから階層構造を解析
-        path_hierarchy = {}
+        # サイトマップを読み込み
         sitemap_path = self.output_dir / "sitemap.json"
-        if sitemap_path.exists():
-            with open(sitemap_path, "r", encoding="utf-8") as f:
-                sitemap = json.load(f)
-                for url, title in sitemap.items():
-                    path_parts = urlparse(url).path.strip('/').split('/')
-                    if len(path_parts) > 1:  # ルートパス以外
-                        # 最大2階層まで考慮
-                        section_path = '/'.join(path_parts[:2])
-                        if section_path not in path_hierarchy:
-                            path_hierarchy[section_path] = {
-                                'title': title,
-                                'urls': []
-                            }
-                        path_hierarchy[section_path]['urls'].append(url)
+        if not sitemap_path.exists():
+            raise ValueError("サイトマップが見つかりません。先に全ページの要約を生成してください。")
+        
+        with open(sitemap_path, "r", encoding="utf-8") as f:
+            sitemap = json.load(f)
+        
+        # サイトのツリー構造を構築
+        site_tree = self._build_site_tree(sitemap)
 
-        # 既存の要約をセクション単位でグループ化
-        section_summaries = {}
-        for md_file in self.output_dir.glob("page_*.md"):
-            try:
-                with open(md_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    title = content.split("\n")[0].strip("# ")
-                    
-                    # ファイル名からURLパスを復元
-                    file_parts = md_file.stem.split('_')[2:]  # page_1_docs_getting-started -> ['docs', 'getting-started']
-                    if len(file_parts) > 0:
-                        # パス階層から最適なセクションを決定
-                        restored_path = '/'.join(file_parts).replace('_', '/')
-                        matched_section = None
-                        
-                        # 最長一致するセクションパスを探す
-                        for section_path in path_hierarchy.keys():
-                            if restored_path.startswith(section_path):
-                                if matched_section is None or len(section_path) > len(matched_section):
-                                    matched_section = section_path
-                        
-                        if matched_section:
-                            section_name = matched_section.replace('/', ' ').title()
-                        else:
-                            # フォールバック: 最初の2つのパス要素を使用
-                            section_parts = file_parts[:2] if len(file_parts) > 1 else file_parts[:1]
-                            section_name = ' '.join(section_parts).replace('-', ' ').title()
-                        
-                        if section_name not in section_summaries:
-                            section_summaries[section_name] = []
-                        section_summaries[section_name].append({
-                            "title": title,
-                            "content": content
-                        })
-            except Exception as e:
-                if self.verbose:
-                    self.console.print(f"[yellow]警告: {md_file}の読み込み中にエラー: {e}[/]")
-        
-        if not section_summaries:
-            raise ValueError("要約ファイルが見つかりません。先に全ページの要約を生成してください。")
-        
         try:
-            # セクションごとの要約を生成
-            section_chain = ChatPromptTemplate.from_template(SECTION_SUMMARY_TEMPLATE) | self.llm | StrOutputParser()
-            processed_sections = {}
-            
-            for section_name, summaries in section_summaries.items():
-                summaries_text = "\n\n---\n\n".join([f"### {s['title']}\n{s['content']}" for s in summaries])
-                section_summary = await section_chain.ainvoke({
-                    "section_name": section_name,
-                    "summaries": summaries_text
-                })
-                processed_sections[section_name] = section_summary
-                
-                # セクション要約をマークダウンファイルとして保存
-                section_filename = f"section_{section_name.lower().replace(' ', '_')}_summary.md"
-                section_path = self.output_dir / section_filename
-                with open(section_path, "w", encoding="utf-8") as f:
-                    f.write(section_summary)
-                
-                if self.verbose:
-                    self.console.print(f"[green]セクション要約を保存: {section_path}[/]")
+            # ツリー構造に基づいて再帰的に要約を生成
+            all_sections = []
+            for section_name, section_node in site_tree.items():
+                section_summary = await self._summarize_tree_node(section_node)
+                if section_summary:
+                    # セクション要約をファイルに保存
+                    section_filename = f"section_{section_name.lower()}_summary.md"
+                    section_path = self.output_dir / section_filename
+                    with open(section_path, "w", encoding="utf-8") as f:
+                        f.write(section_summary)
+                    
+                    all_sections.append(f"## {section_node['title']}\n{section_summary}")
             
             # 最終要約を生成
-            all_sections = "\n\n---\n\n".join([f"## {section_name}\n{summary}" for section_name, summary in processed_sections.items()])
             final_summary = await self.final_summary_chain.ainvoke({
                 "site_name": site_name,
-                "section_summaries": all_sections
+                "section_summaries": "\n\n---\n\n".join(all_sections)
             })
             
             # 最終要約を保存
@@ -863,7 +900,7 @@ class ShallowResearcher:
             with open(final_path, "w", encoding="utf-8") as f:
                 f.write(final_summary)
             
-            # HTMLバージョンも作成
+            # HTMLバージョンを生成
             html_content = markdown.markdown(final_summary)
             html_path = self.output_dir / "final_summary.html"
             with open(html_path, "w", encoding="utf-8") as f:
