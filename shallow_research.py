@@ -43,7 +43,7 @@ LLM_API_KEY_ENV = {
     "azure": "AZURE_OPENAI_API_KEY"
 }
 DEFAULT_LLM_MODELS = {
-    "google": "gemini-1.5-flash",
+    "google": "gemini-2.0-flash",
     "openai": "gpt-4-turbo-preview",
     "anthropic": "claude-3-opus-20240229",
     "azure": "gpt-4"  # Azure OpenAIのデフォルトモデル
@@ -102,14 +102,14 @@ class LLMFactory:
                 model=model,
                 google_api_key=api_key,
                 temperature=kwargs.get("temperature", 0.2),
-                max_output_tokens=kwargs.get("max_tokens", 4096),
+                max_output_tokens=kwargs.get("max_tokens"),
             )
         elif provider in ["openai", "azure"]:
             openai_kwargs = {
                 "model": model if provider == "openai" else None,
                 "deployment_name": kwargs.get("deployment_name") if provider == "azure" else None,
                 "temperature": kwargs.get("temperature", 0.2),
-                "max_tokens": kwargs.get("max_tokens", 4096),
+                "max_tokens": kwargs.get("max_tokens"),
                 "api_key": api_key,
                 "api_version": kwargs.get("api_version") if provider == "azure" else None,
                 "azure": provider == "azure",
@@ -129,14 +129,14 @@ class LLMFactory:
                 model=model,
                 api_key=api_key,
                 temperature=kwargs.get("temperature", 0.2),
-                max_tokens=kwargs.get("max_tokens", 4096),
+                max_tokens=kwargs.get("max_tokens"),
             )
         else:
             raise ValueError(f"不明なLLMプロバイダです: {provider}")
 
 SUMMARY_TEMPLATE = """
 以下のウェブページの内容を要約してください。重要なポイント、主要な概念、コード例があれば含めてください。
-マークダウン形式で返してください。
+日本語でマークダウン形式の要約を作成してください。英語での出力は避けてください。
 
 ページのタイトル: {title}
 ページのURL: {url}
@@ -144,18 +144,31 @@ SUMMARY_TEMPLATE = """
 ページの内容:
 {content}
 
-要約 (マークダウン形式):
+日本語での要約 (マークダウン形式):
+"""
+
+SECTION_SUMMARY_TEMPLATE = """
+以下はドキュメントの1つのセクションに含まれる要約群です。これらの情報を基に、セクションの概要を日本語でマークダウン形式で作成してください。
+セクション名とその配下のページの関係性を考慮して、重要なポイントを階層的にまとめてください。
+英語での出力は避け、必ず日本語で書いてください。
+
+セクション: {section_name}
+含まれる要約:
+{summaries}
+
+日本語でのセクション要約 (マークダウン形式):
 """
 
 FINAL_SUMMARY_TEMPLATE = """
-以下は{site_name}のドキュメントから抽出した要約です。これらの情報を基に、全体的な概要をマークダウン形式で作成してください。
-主要な概念、重要なポイント、関連性を強調し、読者が{site_name}の基本を理解できるようにしてください。
+以下は{site_name}のドキュメントから抽出した各セクションの要約です。これらの情報を基に、プロジェクト全体の概要を日本語でマークダウン形式で作成してください。
+セクション間の関係性を考慮し、トップレベルの構造を明確にしながら、プロジェクトの全体像が理解できるようにまとめてください。
+英語での出力は避け、必ず日本語で書いてください。
 
-{summaries}
+各セクションの要約:
+{section_summaries}
 
-全体要約 (マークダウン形式):
+日本語での全体要約 (マークダウン形式):
 """
-
 
 class ShallowResearcher:
     """ウェブサイトを自動的にクロールして要約するクラス"""
@@ -237,7 +250,6 @@ class ShallowResearcher:
                 model=self.llm_model,
                 api_key=api_key,
                 temperature=0.2,
-                max_output_tokens=4096,
                 **kwargs
             )
         except Exception as e:
@@ -297,7 +309,6 @@ class ShallowResearcher:
             ".mdx-sidebar",
             ".mdx-nav",
             ".gatsby-nav",
-            ".gatsby-menu",
             
             # 一般的なサイドバーの構造を持つ要素
             "aside",
@@ -724,25 +735,49 @@ class ShallowResearcher:
         
         site_name = urlparse(self.root_url).netloc
         
-        # 既存の要約を読み込む
-        all_summaries = ""
+        # 既存の要約をセクション単位でグループ化
+        section_summaries = {}
         for md_file in self.output_dir.glob("page_*.md"):
             try:
                 with open(md_file, "r", encoding="utf-8") as f:
                     content = f.read()
-                    title = content.split("\n")[0].strip("# ")  # 最初の行からタイトルを抽出
-                    all_summaries += f"## {title}\n\n{content}\n\n---\n\n"
+                    title = content.split("\n")[0].strip("# ")
+                    
+                    # ファイル名からセクション名を推測
+                    path_parts = md_file.stem.split('_')[3:]  # page_1_docs_getting-started_ -> ['docs', 'getting-started']
+                    if len(path_parts) > 0:
+                        section_name = path_parts[0].replace('-', ' ').title()
+                        if section_name not in section_summaries:
+                            section_summaries[section_name] = []
+                        section_summaries[section_name].append({
+                            "title": title,
+                            "content": content
+                        })
             except Exception as e:
                 if self.verbose:
                     self.console.print(f"[yellow]警告: {md_file}の読み込み中にエラー: {e}[/]")
         
-        if not all_summaries:
+        if not section_summaries:
             raise ValueError("要約ファイルが見つかりません。先に全ページの要約を生成してください。")
         
         try:
+            # セクションごとの要約を生成
+            section_chain = ChatPromptTemplate.from_template(SECTION_SUMMARY_TEMPLATE) | self.llm | StrOutputParser()
+            processed_sections = {}
+            
+            for section_name, summaries in section_summaries.items():
+                summaries_text = "\n\n---\n\n".join([f"### {s['title']}\n{s['content']}" for s in summaries])
+                section_summary = await section_chain.ainvoke({
+                    "section_name": section_name,
+                    "summaries": summaries_text
+                })
+                processed_sections[section_name] = section_summary
+            
+            # 最終要約を生成
+            all_sections = "\n\n---\n\n".join([f"# {name}\n{summary}" for name, summary in processed_sections.items()])
             final_summary = await self.final_summary_chain.ainvoke({
                 "site_name": site_name,
-                "summaries": all_summaries
+                "section_summaries": all_sections
             })
             
             # 最終要約を保存
