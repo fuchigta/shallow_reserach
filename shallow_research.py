@@ -759,6 +759,24 @@ class ShallowResearcher:
         
         site_name = urlparse(self.root_url).netloc
         
+        # サイトマップから階層構造を解析
+        path_hierarchy = {}
+        sitemap_path = self.output_dir / "sitemap.json"
+        if sitemap_path.exists():
+            with open(sitemap_path, "r", encoding="utf-8") as f:
+                sitemap = json.load(f)
+                for url, title in sitemap.items():
+                    path_parts = urlparse(url).path.strip('/').split('/')
+                    if len(path_parts) > 1:  # ルートパス以外
+                        # 最大2階層まで考慮
+                        section_path = '/'.join(path_parts[:2])
+                        if section_path not in path_hierarchy:
+                            path_hierarchy[section_path] = {
+                                'title': title,
+                                'urls': []
+                            }
+                        path_hierarchy[section_path]['urls'].append(url)
+
         # 既存の要約をセクション単位でグループ化
         section_summaries = {}
         for md_file in self.output_dir.glob("page_*.md"):
@@ -767,10 +785,26 @@ class ShallowResearcher:
                     content = f.read()
                     title = content.split("\n")[0].strip("# ")
                     
-                    # ファイル名からセクション名を推測
-                    path_parts = md_file.stem.split('_')[3:]  # page_1_docs_getting-started_ -> ['docs', 'getting-started']
-                    if len(path_parts) > 0:
-                        section_name = path_parts[0].replace('-', ' ').title()
+                    # ファイル名からURLパスを復元
+                    file_parts = md_file.stem.split('_')[2:]  # page_1_docs_getting-started -> ['docs', 'getting-started']
+                    if len(file_parts) > 0:
+                        # パス階層から最適なセクションを決定
+                        restored_path = '/'.join(file_parts).replace('_', '/')
+                        matched_section = None
+                        
+                        # 最長一致するセクションパスを探す
+                        for section_path in path_hierarchy.keys():
+                            if restored_path.startswith(section_path):
+                                if matched_section is None or len(section_path) > len(matched_section):
+                                    matched_section = section_path
+                        
+                        if matched_section:
+                            section_name = matched_section.replace('/', ' ').title()
+                        else:
+                            # フォールバック: 最初の2つのパス要素を使用
+                            section_parts = file_parts[:2] if len(file_parts) > 1 else file_parts[:1]
+                            section_name = ' '.join(section_parts).replace('-', ' ').title()
+                        
                         if section_name not in section_summaries:
                             section_summaries[section_name] = []
                         section_summaries[section_name].append({
