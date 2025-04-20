@@ -136,28 +136,39 @@ class LLMFactory:
             raise ValueError(f"不明なLLMプロバイダです: {provider}")
 
 SUMMARY_TEMPLATE = """
-以下のウェブページの内容を要約してください。重要なポイント、主要な概念、コード例があれば含めてください。
-日本語でマークダウン形式の要約を作成してください。英語での出力は避けてください。
+以下はウェブページの内容です。これらの情報を基に、ページの全体像を把握できる要約を日本語でマークダウン形式で作成してください。
+
+以下の点に注意して要約を作成してください：
+1. 主要な目的や概念を最初に簡潔に説明
+2. 含まれるトピックを論理的に整理し、階層構造を明確に
+3. 重要な機能やAPIについては具体例を含める
+4. 注意点やベストプラクティスがあれば言及
+5. 技術的な詳細は箇条書きで整理
 
 ページのタイトル: {title}
 ページのURL: {url}
 
 ページの内容:
+---
 {content}
-
-日本語での要約 (マークダウン形式):
+---
 """
 
 SECTION_SUMMARY_TEMPLATE = """
-以下はドキュメントの1つのセクションに含まれる要約群です。これらの情報を基に、セクションの概要を日本語でマークダウン形式で作成してください。
-セクション名とその配下のページの関係性を考慮して、重要なポイントを階層的にまとめてください。
-英語での出力は避け、必ず日本語で書いてください。
+以下はドキュメントの1つのセクションに含まれるサブセクションの要約群です。これらの情報を基に、セクションの全体像を把握できる要約を日本語でマークダウン形式で作成してください。
+
+以下の点に注意して要約を作成してください：
+1. 主要な目的や概念を最初に簡潔に説明
+2. 含まれるサブセクションを論理的に整理し、階層構造を明確に
+3. 重要な機能やAPIについては具体例を含める
+4. 注意点やベストプラクティスがあれば言及
+5. 技術的な詳細は箇条書きで整理
 
 セクション: {section_name}
-含まれる要約:
+サブセクションの要約群:
+---
 {summaries}
-
-日本語でのセクション要約 (マークダウン形式):
+---
 """
 
 FINAL_SUMMARY_TEMPLATE = """
@@ -830,9 +841,18 @@ class ShallowResearcher:
                     "summaries": summaries_text
                 })
                 processed_sections[section_name] = section_summary
+                
+                # セクション要約をマークダウンファイルとして保存
+                section_filename = f"section_{section_name.lower().replace(' ', '_')}_summary.md"
+                section_path = self.output_dir / section_filename
+                with open(section_path, "w", encoding="utf-8") as f:
+                    f.write(section_summary)
+                
+                if self.verbose:
+                    self.console.print(f"[green]セクション要約を保存: {section_path}[/]")
             
             # 最終要約を生成
-            all_sections = "\n\n---\n\n".join([f"# {name}\n{summary}" for name, summary in processed_sections.items()])
+            all_sections = "\n\n---\n\n".join([f"## {section_name}\n{summary}" for section_name, summary in processed_sections.items()])
             final_summary = await self.final_summary_chain.ainvoke({
                 "site_name": site_name,
                 "section_summaries": all_sections
