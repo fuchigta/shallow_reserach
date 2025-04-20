@@ -136,55 +136,58 @@ class LLMFactory:
             raise ValueError(f"不明なLLMプロバイダです: {provider}")
 
 SUMMARY_TEMPLATE = """
-以下はウェブページの内容です。これらの情報を基に、ページの全体像を把握できる要約を日本語でマークダウン形式で作成してください。
+以下はウェブページの内容です。
 
-以下の点に注意して要約を作成してください：
-1. 主要な目的や概念を最初に簡潔に説明
-2. 含まれるトピックを論理的に整理し、見出しを使って階層構造を明確にする
-3. 重要な機能やAPIについては具体例を含める
-4. 注意点やベストプラクティスがあれば言及
-5. 表やmermaid、箇条書きを使って視覚的にわかりやすく整理する
+これらの情報を基に、ページの全体像を把握できる要約を日本語でマークダウン形式で作成してください。
+出力にはマークダウンのみを含めてください。
+
+1. ページの内容をよく読み、深く理解してください。
+2. 理解した内容に基づいて、以下の点に注意して要約を作成してください：
+   1. ページの全体像を視覚的にわかりやすく説明
+   2. 本ページで説明されている主要な概念について、具体例を交えつつ見出しを活用して階層的に整理する
+
+---
 
 ページのタイトル: {title}
 ページのURL: {url}
 
 ページの内容:
----
 {content}
----
 """
 
 SECTION_SUMMARY_TEMPLATE = """
-以下はドキュメントの1つのセクションに含まれるサブセクションの要約群です。これらの情報を基に、セクションの全体像を把握できる要約を日本語でマークダウン形式で作成してください。
+以下はドキュメントの1つのセクションに含まれるサブセクションの要約群です。
 
-以下の点に注意して要約を作成してください：
-1. 主要な目的や概念を最初に簡潔に説明
-2. 含まれるトピックを論理的に整理し、見出しを使って階層構造を明確に
-3. 重要な機能やAPIについては具体例を含める
-4. 注意点やベストプラクティスがあれば言及
-5. 表やmermaid、箇条書きを使って視覚的にわかりやすく整理する
+これらの情報を基に、セクションの全体像を把握できる要約を日本語でマークダウン形式で作成してください。
+出力にはマークダウンのみを含めてください。
+
+1. サブセクションの要約群をよく読み、深く理解してください。
+2. 理解した内容に基づいて、以下の点に注意して要約を作成してください：
+   1. セクションの全体像を視覚的にわかりやすく説明
+   2. 各サブセクションの主要な概念について、具体例を交えつつ見出しを活用して階層的に整理する
+
+---
 
 セクション: {section_name}
 サブセクションの要約群:
----
 {summaries}
----
 """
 
 FINAL_SUMMARY_TEMPLATE = """
-以下は{site_name}のドキュメントから抽出した各セクションの要約です。これらの情報を基に、プロジェクト全体の概要を日本語でマークダウン形式で作成してください。
+以下は{site_name}のドキュメントから抽出した各セクションの要約です。
 
-以下の点に注意して要約を作成してください：
-1. 主要な目的や概念を最初に簡潔に説明
-2. 含まれるトピックを論理的に整理し、見出しを使って階層構造を明確に
-3. 重要な機能やAPIについては具体例を含める
-4. 注意点やベストプラクティスがあれば言及
-5. 表やmermaid、箇条書きを使って視覚的にわかりやすく整理する
+これらの情報を基に、最終的な調査レポートを日本語でマークダウン形式で作成してください。
+出力にはマークダウンのみを含めてください。
+
+1. 各セクションの要約をよく読み、深く理解してください。
+2. 理解した内容に基づいて、以下の点に注意してレポートを作成してください：
+   1. ドキュメントの全体像を視覚的にわかりやすく説明
+   2. 各セクションの主要な概念について、具体例を交えつつ見出しを活用して階層的に整理する
+
+---
 
 各セクションの要約:
----
 {section_summaries}
----
 """
 
 class ShallowResearcher:
@@ -271,6 +274,7 @@ class ShallowResearcher:
                 model=self.llm_model,
                 api_key=api_key,
                 temperature=0.2,
+                max_tokens=8192,
                 **kwargs
             )
         except Exception as e:
@@ -518,7 +522,6 @@ class ShallowResearcher:
             "url": url,
             "content": content,
         }
-    
     async def summarize_page(self, url: str, task_id: Optional[TaskID] = None, progress: Optional[Progress] = None) -> Dict[str, Any]:
         """
         ページを要約する
@@ -571,7 +574,7 @@ class ShallowResearcher:
                             "summary": summary
                         }
                         
-                        if progress and task_id:
+                        if progress is not None and task_id is not None:
                             progress.update(task_id, description=f"完了: {url}", completed=True)
                         
                         return result
@@ -579,7 +582,7 @@ class ShallowResearcher:
                 except Exception as e:
                     retries += 1
                     if retries >= MAX_RETRIES:
-                        if progress and task_id:
+                        if progress is not None and task_id is not None:
                             progress.update(task_id, description=f"エラー: {url}", completed=True)
                         return {
                             "title": f"エラー: {url}",
@@ -588,7 +591,7 @@ class ShallowResearcher:
                         }
                     else:
                         await asyncio.sleep(RETRY_DELAY)
-    
+
     def _load_previous_sitemap(self) -> Optional[Dict[str, str]]:
         """前回のサイトマップを読み込む"""
         sitemap_path = self.output_dir / "sitemap.json"
@@ -816,7 +819,7 @@ class ShallowResearcher:
                 with open(md_files[0], "r", encoding="utf-8") as f:
                     node['content'] = f.read()
                     return node['content']
-            raise ValueError(f"{node['title']}のコンテンツが見つかりません。")
+            return ""
         
         # 子ノードの要約を収集
         children_summaries = []
@@ -832,9 +835,14 @@ class ShallowResearcher:
         # このノードの要約を生成
         section_chain = ChatPromptTemplate.from_template(SECTION_SUMMARY_TEMPLATE) | self.llm | StrOutputParser()
         try:
+            # サマリーをJSON形式に変換
+            summaries_json = json.dumps({
+                "summaries": children_summaries
+            }, ensure_ascii=False)
+            
             node['summary'] = await section_chain.ainvoke({
                 "section_name": node['title'],
-                "summaries": "\n\n---\n\n".join(children_summaries)
+                "summaries": summaries_json
             })
             
             # ノードの要約をファイルに保存
@@ -845,7 +853,7 @@ class ShallowResearcher:
                 file_name = f"node_{node['title']}_summary.md".lower()
                 
             # ファイル名の特殊文字を置換
-            file_name = file_name.replace('/', '_').replace(':', '_').replace('?', '_').replace('&', '_').replace(' ', '_')
+            file_name = file_name.replace('/', '_').replace('|', '_').replace(':', '_').replace('?', '_').replace('&', '_').replace(' ', '_')
             file_path = self.output_dir / file_name
             
             # 要約を保存
@@ -895,10 +903,14 @@ class ShallowResearcher:
                     
                     all_sections.append(f"## {section_node['title']}\n{section_summary}")
             
-            # 最終要約を生成
+            # 最終要約を生成（セクションサマリーをJSONで渡す）
+            section_summaries_json = json.dumps({
+                "sections": all_sections
+            }, ensure_ascii=False)
+            
             final_summary = await self.final_summary_chain.ainvoke({
                 "site_name": site_name,
-                "section_summaries": "\n\n---\n\n".join(all_sections)
+                "section_summaries": section_summaries_json
             })
             
             # 最終要約を保存
@@ -965,12 +977,12 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="詳細出力モード")
     parser.add_argument("-f", "--force", action="store_true", help="すべてのページを強制的に再実行")
     parser.add_argument("--final-only", action="store_true", help="最終要約のみを生成")
+    parser.add_argument("--restrict-path", action="store_true", default=True, help="ルートURLのパスに基づいてURLを制限する")
     
     # OpenAI互換サービスのオプション
     parser.add_argument("--api-base", help="OpenAI互換サービスのベースURL")
     parser.add_argument("--api-version", help="Azure OpenAIのAPIバージョン")
     parser.add_argument("--deployment-name", help="Azure OpenAIのデプロイメント名")
-    parser.add_argument("--restrict-path", action="store_true", default=True, help="ルートURLのパスに基づいてURLを制限する")
 
     args = parser.parse_args()
     
