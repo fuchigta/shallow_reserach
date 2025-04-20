@@ -140,10 +140,10 @@ SUMMARY_TEMPLATE = """
 
 以下の点に注意して要約を作成してください：
 1. 主要な目的や概念を最初に簡潔に説明
-2. 含まれるトピックを論理的に整理し、階層構造を明確に
+2. 含まれるトピックを論理的に整理し、見出しを使って階層構造を明確にする
 3. 重要な機能やAPIについては具体例を含める
 4. 注意点やベストプラクティスがあれば言及
-5. 技術的な詳細は箇条書きで整理
+5. 表やmermaid、箇条書きを使って視覚的にわかりやすく整理する
 
 ページのタイトル: {title}
 ページのURL: {url}
@@ -159,10 +159,10 @@ SECTION_SUMMARY_TEMPLATE = """
 
 以下の点に注意して要約を作成してください：
 1. 主要な目的や概念を最初に簡潔に説明
-2. 含まれるサブセクションを論理的に整理し、階層構造を明確に
+2. 含まれるトピックを論理的に整理し、見出しを使って階層構造を明確に
 3. 重要な機能やAPIについては具体例を含める
 4. 注意点やベストプラクティスがあれば言及
-5. 技術的な詳細は箇条書きで整理
+5. 表やmermaid、箇条書きを使って視覚的にわかりやすく整理する
 
 セクション: {section_name}
 サブセクションの要約群:
@@ -173,13 +173,18 @@ SECTION_SUMMARY_TEMPLATE = """
 
 FINAL_SUMMARY_TEMPLATE = """
 以下は{site_name}のドキュメントから抽出した各セクションの要約です。これらの情報を基に、プロジェクト全体の概要を日本語でマークダウン形式で作成してください。
-セクション間の関係性を考慮し、トップレベルの構造を明確にしながら、プロジェクトの全体像が理解できるようにまとめてください。
-英語での出力は避け、必ず日本語で書いてください。
+
+以下の点に注意して要約を作成してください：
+1. 主要な目的や概念を最初に簡潔に説明
+2. 含まれるトピックを論理的に整理し、見出しを使って階層構造を明確に
+3. 重要な機能やAPIについては具体例を含める
+4. 注意点やベストプラクティスがあれば言及
+5. 表やmermaid、箇条書きを使って視覚的にわかりやすく整理する
 
 各セクションの要約:
+---
 {section_summaries}
-
-日本語での全体要約 (マークダウン形式):
+---
 """
 
 class ShallowResearcher:
@@ -784,6 +789,7 @@ class ShallowResearcher:
                     current[part] = {
                         'title': title if i == len(path_parts) - 1 else part.replace('-', ' ').title(),
                         'url': url if i == len(path_parts) - 1 else None,
+                        'part': part,
                         'children': {},
                         'content': None,
                         'summary': None
@@ -810,12 +816,12 @@ class ShallowResearcher:
                 with open(md_files[0], "r", encoding="utf-8") as f:
                     node['content'] = f.read()
                     return node['content']
-            return f"# {node['title']}\n\nコンテンツが見つかりません。"
+            raise ValueError(f"{node['title']}のコンテンツが見つかりません。")
         
         # 子ノードの要約を収集
         children_summaries = []
         for child_name, child_node in node['children'].items():
-            child_path = f"{parent_path}/{child_name}" if parent_path else child_name
+            child_path = f"{parent_path}/{node['part']}" if parent_path else node['part']
             child_summary = await self._summarize_tree_node(child_node, child_path)
             if child_summary:
                 children_summaries.append(child_summary)
@@ -844,7 +850,7 @@ class ShallowResearcher:
             
             # 要約を保存
             with open(file_path, "w", encoding="utf-8") as f:
-                f.write(f"# {node['title']}\n\n{node['summary']}")
+                f.write(node['summary'])
             
             if self.verbose:
                 self.console.print(f"[green]ノード要約を保存: {file_path}[/]")
