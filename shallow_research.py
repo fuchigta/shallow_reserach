@@ -33,6 +33,7 @@ DEFAULT_CONCURRENCY = 3
 DEFAULT_RATE_LIMIT = 1  # リクエスト間の秒数
 MAX_RETRIES = 3
 RETRY_DELAY = 2
+PATH_RESTRICTION_ENABLED = True  # パス制限のデフォルト値
 
 # プロバイダ設定
 LLM_PROVIDERS = ["google", "openai", "anthropic", "azure"]  # 優先順位順
@@ -183,7 +184,8 @@ class ShallowResearcher:
         llm_model: Optional[str] = None,
         api_key: Optional[str] = None,
         verbose: bool = False,
-        force_rerun: bool = False,  # 強制再実行オプションを追加
+        force_rerun: bool = False,
+        restrict_path: bool = PATH_RESTRICTION_ENABLED,  # パス制限オプション
         **kwargs
     ):
         """
@@ -199,13 +201,16 @@ class ShallowResearcher:
             api_key: LLM APIキー
             verbose: 詳細出力モード
             force_rerun: すべてのページを強制的に再実行
+            restrict_path: ルートURLのパスに基づいてURLを制限する
         """
         self.root_url = url
         self.output_dir = Path(output_dir)
         self.concurrency = concurrency
         self.rate_limit = rate_limit
         self.verbose = verbose
-        self.force_rerun = force_rerun  # 強制再実行フラグを保存
+        self.force_rerun = force_rerun
+        self.restrict_path = restrict_path  # パス制限設定を保存
+        self.root_path = urlparse(url).path  # ルートURLのパスを保存
         self.site_map = {}
         self.summaries = {}
         self.visited = set()
@@ -272,6 +277,25 @@ class ShallowResearcher:
         """非同期リソースの初期化"""
         self.semaphore = asyncio.Semaphore(self.concurrency)
     
+    def _should_include_url(self, url: str) -> bool:
+        """
+        URLが処理対象に含めるべきかどうかを判定する
+        
+        Args:
+            url: チェックするURL
+            
+        Returns:
+            bool: URLを含めるべきかどうか
+        """
+        if not self.restrict_path:
+            return True
+            
+        parsed_url = urlparse(url)
+        url_path = parsed_url.path
+        
+        # ルートURLのパスで始まるURLのみを含める
+        return url_path.startswith(self.root_path)
+
     async def extract_sitemap(self, page: Page) -> Dict[str, str]:
         """
         ページからサイトマップを抽出する
@@ -339,8 +363,9 @@ class ShallowResearcher:
                         if href and not href.startswith("#") and not href.startswith("javascript:"):
                             # 相対URLを絶対URLに変換
                             abs_url = urljoin(base_url, href)
-                            # 同じドメイン内のURLのみ対象とする
-                            if urlparse(abs_url).netloc == urlparse(base_url).netloc:
+                            # 同じドメイン内のURLかつパス制限に合致するURLのみ対象とする
+                            if (urlparse(abs_url).netloc == urlparse(base_url).netloc and
+                                self._should_include_url(abs_url)):
                                 title = await elem.text_content()
                                 title = title.strip() if title else "No Title"
                                 sitemap[abs_url] = title
@@ -394,7 +419,6 @@ class ShallowResearcher:
                                         # パスの最後の部分を取得し、ハイフンやアンダースコアを空白に変換
                                         path_title = path.rstrip('/').split('/')[-1]
                                         path_title = path_title.replace('-', ' ').replace('_', ' ')
-                                        path_title = ' '.join(word.capitalize() for word in path_title.split())
                                         title = path_title
                                 
                                 sitemap[abs_url] = title
@@ -849,6 +873,7 @@ def main():
     parser.add_argument("--api-base", help="OpenAI互換サービスのベースURL")
     parser.add_argument("--api-version", help="Azure OpenAIのAPIバージョン")
     parser.add_argument("--deployment-name", help="Azure OpenAIのデプロイメント名")
+    parser.add_argument("--restrict-path", action="store_true", default=True, help="ルートURLのパスに基づいてURLを制限する")
 
     args = parser.parse_args()
     
@@ -872,6 +897,7 @@ def main():
         api_key=args.api_key,
         verbose=args.verbose,
         force_rerun=args.force,
+        restrict_path=args.restrict_path,
         **kwargs  # OpenAI互換サービスの設定を追加
     )
     
