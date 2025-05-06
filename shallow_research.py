@@ -972,7 +972,7 @@ def main():
     parser.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY, help=f"同時実行数 (デフォルト: {DEFAULT_CONCURRENCY})")
     parser.add_argument("-r", "--rate-limit", type=float, default=DEFAULT_RATE_LIMIT, help=f"リクエスト間の秒数 (デフォルト: {DEFAULT_RATE_LIMIT})")
     parser.add_argument("-m", "--model", default=None, help="使用するLLMモデル（指定がない場合はプロバイダのデフォルトモデル）")
-    parser.add_argument("-p", "--provider", default=LLM_PROVIDERS[0], help=f"LLMプロバイダ (デフォルト: {LLM_PROVIDERS[0]})")
+    parser.add_argument("-p", "--provider", default=None, help="LLMプロバイダ")
     parser.add_argument("-k", "--api-key", help="API Key (環境変数で設定可能)")
     parser.add_argument("-v", "--verbose", action="store_true", help="詳細出力モード")
     parser.add_argument("-f", "--force", action="store_true", help="すべてのページを強制的に再実行")
