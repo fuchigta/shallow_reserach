@@ -12,15 +12,19 @@ import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Literal
 from urllib.parse import urljoin, urlparse
+from pydantic import BaseModel, Field
 
 import markdown
 from playwright.async_api import async_playwright, Page
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser
 from langchain_core.language_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.output_parsers import JsonOutputParser
+from langchain.agents import create_tool_calling_agent, AgentExecutor
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
 
@@ -58,6 +62,19 @@ OPENAI_ENV_VARS = {
 }
 DEFAULT_OPENAI_API_BASE = "https://api.openai.com/v1"  # OpenAIのデフォルトベースURL
 DEFAULT_OPENAI_API_VERSION = None  # Azure OpenAIの場合は必要
+
+# Pydanticモデル
+class SitemapEntry(BaseModel):
+    """サイトマップのエントリ"""
+    url: str = Field(description="ページのURL")
+    title: str = Field(description="ページのタイトル")
+
+class SitemapResult(BaseModel):
+    """サイトマップ抽出結果"""
+    sitemap: Dict[str, str] = Field(
+        description="URLをキー、タイトルを値とするサイトマップ",
+        default_factory=dict
+    )
 
 def detect_available_provider() -> Optional[str]:
     """
@@ -173,6 +190,29 @@ SECTION_SUMMARY_TEMPLATE = """
 {summaries}
 """
 
+SITEMAP_EXTRACTION_TEMPLATE = """
+あなたはウェブサイトからサイトマップを抽出するエキスパートです。
+以下のURLからナビゲーションリンクを抽出してください。
+
+URL: {url}
+
+タスク:
+1. 指定されたURLのページを開いてください
+2. ナビゲーション要素（サイドバー、メニュー、目次など）からリンクを抽出してください
+3. 以下の条件に従ってリンクをフィルタリングしてください：
+   - 同じドメイン内のリンクのみ
+   - "#"で始まるアンカーリンクは除外
+   - "javascript:"で始まるリンクは除外
+   - パス制限が有効な場合、ルートパス "{root_path}" で始まるURLのみ含める
+
+利用可能なツールを使用して、効率的にリンクを抽出してください。
+構造化された出力形式でサイトマップを返してください。
+
+{format_instructions}
+
+{agent_scratchpad}
+"""
+
 FINAL_SUMMARY_TEMPLATE = """
 以下は{site_name}のドキュメントから抽出した各セクションの要約です。
 
@@ -205,6 +245,7 @@ class ShallowResearcher:
         verbose: bool = False,
         force_rerun: bool = False,
         restrict_path: bool = PATH_RESTRICTION_ENABLED,  # パス制限オプション
+        mcp_server_url: Optional[str] = None,  # MCPサーバーのURL
         **kwargs
     ):
         """
@@ -221,6 +262,7 @@ class ShallowResearcher:
             verbose: 詳細出力モード
             force_rerun: すべてのページを強制的に再実行
             restrict_path: ルートURLのパスに基づいてURLを制限する
+            mcp_server_url: MCPサーバーのURL（Playwright MCPサーバー）
         """
         self.root_url = url
         self.output_dir = Path(output_dir)
@@ -230,10 +272,12 @@ class ShallowResearcher:
         self.force_rerun = force_rerun
         self.restrict_path = restrict_path  # パス制限設定を保存
         self.root_path = urlparse(url).path  # ルートURLのパスを保存
+        self.mcp_server_url = mcp_server_url if mcp_server_url is not None else "npx @playwright/mcp@latest"  # デフォルトのPlaywright MCPサーバー
         self.site_map = {}
         self.summaries = {}
         self.visited = set()
         self.semaphore = None  # asyncioで初期化
+        self.mcp_client = None  # MCPクライアント
         
         # コンソール出力
         self.console = Console()
@@ -292,10 +336,70 @@ class ShallowResearcher:
             | self.llm
             | StrOutputParser()
         )
+        
+        # Structured Output用のパーサー
+        self.sitemap_parser = PydanticOutputParser(pydantic_object=SitemapResult)
+        
+        # サイトマップ抽出用のプロンプト（構造化出力対応）
+        self.sitemap_prompt = ChatPromptTemplate.from_template(SITEMAP_EXTRACTION_TEMPLATE)
+        
+        # MCP Agent（初期化時には設定せず、initialize()で設定）
+        self.mcp_agent = None
     
     async def initialize(self):
         """非同期リソースの初期化"""
         self.semaphore = asyncio.Semaphore(self.concurrency)
+        
+        # MCPクライアントの初期化
+        if self.mcp_server_url == "":
+            # MCPを無効化
+            if self.verbose:
+                self.console.print("[cyan]MCPを無効化しました。フォールバック実装を使用します。[/]")
+            self.mcp_client = None
+            self.mcp_agent = None
+        else:
+            try:
+                # MultiServerMCPClientの設定
+                server_config = {
+                    "playwright": {
+                        "command": self.mcp_server_url.split()[0],  # "npx"
+                        "args": self.mcp_server_url.split()[1:],   # ["--yes", "@microsoft/playwright-mcp"]
+                        "transport": "stdio"
+                    }
+                }
+                
+                self.mcp_client = MultiServerMCPClient(server_config)
+                if self.verbose:
+                    self.console.print(f"[cyan]MCPクライアントを設定しました: {self.mcp_server_url}[/]")
+                
+                # MCPツールを取得してエージェントを作成
+                mcp_tools = await self.mcp_client.get_tools()
+                if mcp_tools:
+                    # LLMにツールをバインド
+                    try:
+                        llm_with_tools = self.llm.bind_tools(mcp_tools)
+                        # Tool Calling Agentを作成
+                        self.mcp_agent = create_tool_calling_agent(llm_with_tools, mcp_tools, self.sitemap_prompt)
+                        self.mcp_executor = AgentExecutor(agent=self.mcp_agent, tools=mcp_tools, verbose=self.verbose)
+                        if self.verbose:
+                            self.console.print(f"[cyan]MCPエージェント（ツールバインド対応）を作成しました（ツール数: {len(mcp_tools)}）[/]")
+                    except AttributeError as e:
+                        if self.verbose:
+                            self.console.print(f"[yellow]警告: LLMにbind_toolsメソッドがありません: {e}[/]")
+                            self.console.print("[yellow]フォールバック実装を使用します[/]")
+                        self.mcp_client = None
+                        self.mcp_agent = None
+                else:
+                    if self.verbose:
+                        self.console.print("[yellow]警告: MCPツールが見つかりませんでした[/]")
+                    self.mcp_client = None
+                    
+            except Exception as e:
+                if self.verbose:
+                    self.console.print(f"[yellow]警告: MCPサーバーへの接続に失敗しました: {e}[/]")
+                    self.console.print("[yellow]フォールバック実装を使用します[/]")
+                self.mcp_client = None
+                self.mcp_agent = None
     
     def _should_include_url(self, url: str) -> bool:
         """
@@ -316,13 +420,109 @@ class ShallowResearcher:
         # ルートURLのパスで始まるURLのみを含める
         return url_path.startswith(self.root_path)
 
-    async def extract_sitemap(self, page: Page) -> Dict[str, str]:
+    async def extract_sitemap_with_mcp(self) -> Dict[str, str]:
         """
-        ページからサイトマップを抽出する
+        LLMエージェントとPlaywright MCPを使用してサイトマップを抽出する
         
-        Args:
-            page: Playwrightのページオブジェクト
+        Returns:
+            サイトマップ (URL -> タイトル のマッピング)
+        """
+        if not self.mcp_agent or not hasattr(self, 'mcp_executor'):
+            if self.verbose:
+                self.console.print("[yellow]MCPエージェントが利用できません。フォールバック実装を使用します。[/]")
+            return await self.extract_sitemap_fallback()
+        
+        try:
+            # LLMエージェントにサイトマップ抽出を依頼
+            if self.verbose:
+                self.console.print(f"[cyan]MCPエージェントでサイトマップ抽出を開始: {self.root_url}[/]")
             
+            # プロンプトに必要な変数を準備
+            prompt_input = {
+                "url": self.root_url,
+                "root_path": self.root_path if self.restrict_path else "",
+                "format_instructions": self.sitemap_parser.get_format_instructions(),
+                "input": f"指定されたURL({self.root_url})からナビゲーションリンクを抽出してください。",
+                "agent_scratchpad": ""
+            }
+            
+            result = await self.mcp_executor.ainvoke(prompt_input)
+            
+            if self.verbose:
+                self.console.print(f"[cyan]MCPエージェントの実行完了[/]")
+            
+            # 構造化出力でない場合の処理
+            agent_output = result.get("output", "")
+            if self.verbose:
+                self.console.print(f"[cyan]エージェントの出力: {agent_output}[/]")
+                self.console.print(f"[cyan]レスポンス全体: {result}[/]")
+            
+            # JSON形式の出力を直接解析
+            import json
+            import re
+            
+            # JSONパターンを探す
+            json_match = re.search(r'\{[^{}]*"sitemap"[^{}]*\{[^}]*\}[^{}]*\}', agent_output)
+            if json_match:
+                try:
+                    json_str = json_match.group(0)
+                    parsed_result = json.loads(json_str)
+                    
+                    if "sitemap" in parsed_result and isinstance(parsed_result["sitemap"], dict):
+                        # URLフィルタリング
+                        filtered_sitemap = {}
+                        for url, title in parsed_result["sitemap"].items():
+                            if self._should_include_url(url):
+                                filtered_sitemap[url] = title
+                        
+                        if filtered_sitemap:
+                            if self.verbose:
+                                self.console.print(f"[green]MCPエージェントを使用して{len(filtered_sitemap)}個のリンクを抽出しました[/]")
+                            return filtered_sitemap
+                        
+                except json.JSONDecodeError as e:
+                    if self.verbose:
+                        self.console.print(f"[yellow]JSON解析エラー: {e}[/]")
+            
+            # より柔軟なパターンマッチング
+            url_pattern = r'https?://[^\s"\'<>]+'
+            urls = re.findall(url_pattern, agent_output)
+            
+            if urls:
+                sitemap = {}
+                base_netloc = urlparse(self.root_url).netloc
+                
+                for url in urls:
+                    if (urlparse(url).netloc == base_netloc and 
+                        self._should_include_url(url) and
+                        not url.endswith(('.png', '.jpg', '.jpeg', '.gif', '.css', '.js'))):
+                        # URLから簡単なタイトルを生成
+                        path = urlparse(url).path
+                        title = path.rstrip('/').split('/')[-1].replace('-', ' ').replace('_', ' ').title()
+                        if not title or title == "":
+                            title = "Home"
+                        sitemap[url] = title
+                
+                if sitemap:
+                    if self.verbose:
+                        self.console.print(f"[green]URLパターンマッチングで{len(sitemap)}個のリンクを抽出しました[/]")
+                    return sitemap
+            
+            # すべて失敗した場合はフォールバック
+            if self.verbose:
+                self.console.print("[yellow]MCPエージェントでリンクが見つかりませんでした。フォールバック実装を使用します。[/]")
+            return await self.extract_sitemap_fallback()
+            
+        except Exception as e:
+            if self.verbose:
+                self.console.print(f"[yellow]MCPエージェント実行中にエラーが発生しました: {e}[/]")
+                self.console.print("[yellow]フォールバック実装を使用します[/]")
+            return await self.extract_sitemap_fallback()
+    
+    async def extract_sitemap_fallback(self) -> Dict[str, str]:
+        """
+        フォールバック: 直接Playwrightを使用してサイトマップを抽出する
+        
         Returns:
             サイトマップ (URL -> タイトル のマッピング)
         """
@@ -374,77 +574,87 @@ class ShallowResearcher:
         sitemap = {}
         base_url = self.root_url
         
-        for selector in nav_selectors:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            
             try:
-                nav_elements = await page.query_selector_all(f"{selector} a")
-                if nav_elements:
-                    for elem in nav_elements:
-                        href = await elem.get_attribute("href")
-                        if href and not href.startswith("#") and not href.startswith("javascript:"):
-                            # 相対URLを絶対URLに変換
-                            abs_url = urljoin(base_url, href)
-                            # 同じドメイン内のURLかつパス制限に合致するURLのみ対象とする
-                            if (urlparse(abs_url).netloc == urlparse(base_url).netloc and
-                                self._should_include_url(abs_url)):
-                                title = await elem.text_content()
-                                title = title.strip() if title else "No Title"
-                                sitemap[abs_url] = title
-            except Exception as e:
-                if self.verbose:
-                    self.console.print(f"[yellow]警告: ナビゲーション要素 {selector} の抽出中にエラーが発生しました: {e}[/]")
-        
-        # サイトマップが空の場合、ページ内のすべてのリンクを取得するフォールバック
-        if not sitemap:
-            try:
-                # まずヘッダーやメインコンテンツ内のリンクを探す
-                main_link_selectors = [
-                    "header a",
-                    "main a",
-                    "article a",
-                    ".content a",
-                    "#content a",
-                    ".main-content a",
-                    ".markdown-body a",
-                    ".prose a",
-                    "[role=main] a"
-                ]
+                await page.goto(self.root_url, wait_until="networkidle")
                 
-                for selector in main_link_selectors:
-                    links = await page.query_selector_all(selector)
-                    for link in links:
-                        href = await link.get_attribute("href")
-                        if href and not href.startswith("#") and not href.startswith("javascript:"):
-                            abs_url = urljoin(base_url, href)
-                            if urlparse(abs_url).netloc == urlparse(base_url).netloc:
-                                title = await link.text_content()
-                                title = title.strip() if title else "No Title"
-                                sitemap[abs_url] = title
+                for selector in nav_selectors:
+                    try:
+                        nav_elements = await page.query_selector_all(f"{selector} a")
+                        if nav_elements:
+                            for elem in nav_elements:
+                                href = await elem.get_attribute("href")
+                                if href and not href.startswith("#") and not href.startswith("javascript:"):
+                                    # 相対URLを絶対URLに変換
+                                    abs_url = urljoin(base_url, href)
+                                    # 同じドメイン内のURLかつパス制限に合致するURLのみ対象とする
+                                    if (urlparse(abs_url).netloc == urlparse(base_url).netloc and
+                                        self._should_include_url(abs_url)):
+                                        title = await elem.text_content()
+                                        title = title.strip() if title else "No Title"
+                                        sitemap[abs_url] = title
+                    except Exception as e:
+                        if self.verbose:
+                            self.console.print(f"[yellow]警告: ナビゲーション要素 {selector} の抽出中にエラーが発生しました: {e}[/]")
                 
-                # まだリンクが見つからない場合は、すべてのリンクを対象にする
+                # サイトマップが空の場合、ページ内のすべてのリンクを取得するフォールバック
                 if not sitemap:
-                    all_links = await page.query_selector_all("a")
-                    for link in all_links:
-                        href = await link.get_attribute("href")
-                        if href and not href.startswith("#") and not href.startswith("javascript:"):
-                            abs_url = urljoin(base_url, href)
-                            if urlparse(abs_url).netloc == urlparse(base_url).netloc:
-                                # タイトルの抽出を改善
-                                title = await link.evaluate("el => el.getAttribute('title') || el.textContent")
-                                title = title.strip() if title else "No Title"
-                                
-                                # URLのパスからタイトルを推測（タイトルが空の場合）
-                                if title == "No Title":
-                                    path = urlparse(abs_url).path
-                                    if path:
-                                        # パスの最後の部分を取得し、ハイフンやアンダースコアを空白に変換
-                                        path_title = path.rstrip('/').split('/')[-1]
-                                        path_title = path_title.replace('-', ' ').replace('_', ' ')
-                                        title = path_title
-                                
-                                sitemap[abs_url] = title
-            except Exception as e:
-                if self.verbose:
-                    self.console.print(f"[yellow]警告: リンク抽出中にエラーが発生しました: {e}[/]")
+                    try:
+                        # まずヘッダーやメインコンテンツ内のリンクを探す
+                        main_link_selectors = [
+                            "header a",
+                            "main a",
+                            "article a",
+                            ".content a",
+                            "#content a",
+                            ".main-content a",
+                            ".markdown-body a",
+                            ".prose a",
+                            "[role=main] a"
+                        ]
+                        
+                        for selector in main_link_selectors:
+                            links = await page.query_selector_all(selector)
+                            for link in links:
+                                href = await link.get_attribute("href")
+                                if href and not href.startswith("#") and not href.startswith("javascript:"):
+                                    abs_url = urljoin(base_url, href)
+                                    if urlparse(abs_url).netloc == urlparse(base_url).netloc:
+                                        title = await link.text_content()
+                                        title = title.strip() if title else "No Title"
+                                        sitemap[abs_url] = title
+                        
+                        # まだリンクが見つからない場合は、すべてのリンクを対象にする
+                        if not sitemap:
+                            all_links = await page.query_selector_all("a")
+                            for link in all_links:
+                                href = await link.get_attribute("href")
+                                if href and not href.startswith("#") and not href.startswith("javascript:"):
+                                    abs_url = urljoin(base_url, href)
+                                    if urlparse(abs_url).netloc == urlparse(base_url).netloc:
+                                        # タイトルの抽出を改善
+                                        title = await link.evaluate("el => el.getAttribute('title') || el.textContent")
+                                        title = title.strip() if title else "No Title"
+                                        
+                                        # URLのパスからタイトルを推測（タイトルが空の場合）
+                                        if title == "No Title":
+                                            path = urlparse(abs_url).path
+                                            if path:
+                                                # パスの最後の部分を取得し、ハイフンやアンダースコアを空白に変換
+                                                path_title = path.rstrip('/').split('/')[-1]
+                                                path_title = path_title.replace('-', ' ').replace('_', ' ')
+                                                title = path_title
+                                        
+                                        sitemap[abs_url] = title
+                    except Exception as e:
+                        if self.verbose:
+                            self.console.print(f"[yellow]警告: リンク抽出中にエラーが発生しました: {e}[/]")
+            
+            finally:
+                await browser.close()
         
         return sitemap
     
@@ -637,7 +847,7 @@ class ShallowResearcher:
             
         return has_page_summaries
 
-    def _get_pending_pages(self, previous_sitemap: Optional[Dict[str, str]]) -> List[str]:
+    def _get_pending_pages(self, _: Optional[Dict[str, str]]) -> List[str]:
         """処理が必要なページのURLリストを取得"""
         pending_pages = []
         
@@ -683,19 +893,20 @@ class ShallowResearcher:
                 
                 try:
                     await page.goto(self.root_url, wait_until="networkidle")
-                    self.site_map = await self.extract_sitemap(page)
+                    # ルートページのタイトルを取得
+                    root_title = await page.title()
+                    await browser.close()
+                    
+                    # MCPを使用してサイトマップを抽出（現在はフォールバック）
+                    self.site_map = await self.extract_sitemap_with_mcp()
                     
                     # ルートページも追加
-                    root_title = await page.title()
                     self.site_map[self.root_url] = root_title
                     
                     progress.update(sitemap_task, completed=True, description=f"サイトマップ取得完了: {len(self.site_map)}ページ")
                 except Exception as e:
                     progress.update(sitemap_task, completed=True, description=f"[red]サイトマップ取得エラー: {e}[/]")
-                    await browser.close()
                     return
-                
-                await browser.close()
             
             # 前回のサイトマップを読み込み
             previous_sitemap = self._load_previous_sitemap()
@@ -823,7 +1034,7 @@ class ShallowResearcher:
         
         # 子ノードの要約を収集
         children_summaries = []
-        for child_name, child_node in node['children'].items():
+        for _, child_node in node['children'].items():
             child_path = f"{parent_path}/{node['part']}" if parent_path else node['part']
             child_summary = await self._summarize_tree_node(child_node, child_path)
             if child_summary:
@@ -979,6 +1190,9 @@ def main():
     parser.add_argument("--final-only", action="store_true", help="最終要約のみを生成")
     parser.add_argument("--restrict-path", action="store_true", default=True, help="ルートURLのパスに基づいてURLを制限する")
     
+    # MCP関連のオプション
+    parser.add_argument("--mcp-server-url", help="MCPサーバーのコマンド（デフォルト: npx @playwright/mcp@latest）")
+    
     # OpenAI互換サービスのオプション
     parser.add_argument("--api-base", help="OpenAI互換サービスのベースURL")
     parser.add_argument("--api-version", help="Azure OpenAIのAPIバージョン")
@@ -1007,6 +1221,7 @@ def main():
         verbose=args.verbose,
         force_rerun=args.force,
         restrict_path=args.restrict_path,
+        mcp_server_url=args.mcp_server_url,
         **kwargs  # OpenAI互換サービスの設定を追加
     )
     

@@ -19,13 +19,37 @@ ShallowResearch は、ウェブサイト（特に技術ドキュメントや API
 
 ## インストール
 
+### uvを使用する場合（推奨）
+
 ```bash
+# uvをインストール（まだの場合）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # リポジトリのクローン
 git clone https://github.com/fuchigta/shallow_reserach.git
 cd shallow_reserach
 
 # 依存関係のインストール
-pip install -r requirements.txt
+uv sync
+
+# Playwrightブラウザのインストール
+uv run playwright install chromium
+```
+
+### 従来のpipを使用する場合
+
+```bash
+# リポジトリのクローン
+git clone https://github.com/fuchigta/shallow_reserach.git
+cd shallow_reserach
+
+# 仮想環境の作成と有効化
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+# または .venv\Scripts\activate  # Windows
+
+# 依存関係のインストール
+pip install -e .
 
 # Playwrightブラウザのインストール
 playwright install chromium
@@ -33,7 +57,13 @@ playwright install chromium
 
 ## 使用方法
 
-基本的な使用方法:
+### uvを使用する場合
+
+```bash
+uv run shallow-research https://example.com/docs
+```
+
+### 従来のpipを使用する場合
 
 ```bash
 python shallow_research.py https://example.com/docs
@@ -48,6 +78,10 @@ export OPENAI_API_KEY=your_api_key    # OpenAI
 export ANTHROPIC_API_KEY=your_api_key # Anthropic
 export AZURE_OPENAI_API_KEY=your_api_key # Azure OpenAI
 
+# uvを使用する場合
+uv run shallow-research https://example.com/docs  # 自動選択
+
+# pipを使用する場合
 python shallow_research.py https://example.com/docs  # 自動選択
 ```
 
@@ -56,22 +90,22 @@ python shallow_research.py https://example.com/docs  # 自動選択
 ```bash
 # Google AI (デフォルト)
 export GOOGLE_API_KEY=your_api_key
-python shallow_research.py https://example.com/docs
+uv run shallow-research https://example.com/docs
 
 # OpenAI GPT-4
 export OPENAI_API_KEY=your_api_key
-python shallow_research.py https://example.com/docs -p openai
+uv run shallow-research https://example.com/docs -p openai
 
 # Azure OpenAI
 export AZURE_API_KEY=your_api_key
-python shallow_research.py https://example.com/docs -p azure \
+uv run shallow-research https://example.com/docs -p azure \
   --api-base "https://your-resource.openai.azure.com" \
   --api-version "2024-02-15-preview" \
   --deployment-name "your-deployment"
 
 # Anthropic Claude
 export ANTHROPIC_API_KEY=your_api_key
-python shallow_research.py https://example.com/docs -p anthropic
+uv run shallow-research https://example.com/docs -p anthropic
 ```
 
 OpenAI 互換サービスの設定は、環境変数でも指定できます：
@@ -87,22 +121,25 @@ export OPENAI_DEPLOYMENT_NAME="your-deployment-name"  # デプロイメント名
 
 ```bash
 # 出力ディレクトリを指定
-python shallow_research.py https://example.com/docs -o my_research
+uv run shallow-research https://example.com/docs -o my_research
 
 # 同時実行数とレート制限を調整
-python shallow_research.py https://example.com/docs -c 5 -r 0.5
+uv run shallow-research https://example.com/docs -c 5 -r 0.5
 
 # 異なるLLMモデルを使用
-python shallow_research.py https://example.com/docs -m gpt-4-turbo-preview
+uv run shallow-research https://example.com/docs -m gpt-4-turbo-preview
 
 # 詳細出力モード
-python shallow_research.py https://example.com/docs -v
+uv run shallow-research https://example.com/docs -v
 
 # すべてのページを強制的に再処理
-python shallow_research.py https://example.com/docs -f
+uv run shallow-research https://example.com/docs -f
 
 # 最終要約のみを生成
-python shallow_research.py https://example.com/docs --final-only
+uv run shallow-research https://example.com/docs --final-only
+
+# カスタムMCPサーバーを使用
+uv run shallow-research https://example.com/docs --mcp-server-url "node playwright-server.js"
 ```
 
 ## 出力ファイル
