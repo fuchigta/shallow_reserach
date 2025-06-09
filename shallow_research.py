@@ -248,7 +248,7 @@ class ShallowResearcher:
         self.restrict_path = restrict_path  # パス制限設定を保存
         self.root_path = urlparse(url).path  # ルートURLのパスを保存
         # デフォルトのPlaywright MCPサーバー（ヘッドレスモード）
-        self.mcp_server_url = mcp_server_url if mcp_server_url is not None else "npx @playwright/mcp@latest --headless"
+        self.mcp_server_url = mcp_server_url if mcp_server_url is not None else "npx @playwright/mcp@latest --headless --browser chromium"
         self.site_map = {}
         self.summaries = {}
         self.visited = set()
