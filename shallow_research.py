@@ -12,11 +12,14 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Literal
 from urllib.parse import urlparse
 from pydantic import BaseModel, Field
+import aiohttp
+from bs4 import BeautifulSoup
 
 from playwright.async_api import async_playwright, Page
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser
 from langchain_core.language_models import BaseChatModel
+from langchain.globals import set_debug, set_verbose
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
@@ -34,7 +37,6 @@ DEFAULT_CONCURRENCY = 3
 DEFAULT_RATE_LIMIT = 1  # リクエスト間の秒数
 MAX_RETRIES = 3
 RETRY_DELAY = 2
-PATH_RESTRICTION_ENABLED = True  # パス制限のデフォルト値
 
 # プロバイダ設定
 LLM_PROVIDERS = ["google", "openai", "anthropic", "azure"]  # 優先順位順
@@ -219,7 +221,6 @@ class ShallowResearcher:
         api_key: Optional[str] = None,
         verbose: bool = False,
         force_rerun: bool = False,
-        restrict_path: bool = PATH_RESTRICTION_ENABLED,  # パス制限オプション
         mcp_server_url: Optional[str] = None,  # MCPサーバーのURL
         **kwargs
     ):
@@ -236,7 +237,6 @@ class ShallowResearcher:
             api_key: LLM APIキー
             verbose: 詳細出力モード
             force_rerun: すべてのページを強制的に再実行
-            restrict_path: ルートURLのパスに基づいてURLを制限する
             mcp_server_url: MCPサーバーのURL（Playwright MCPサーバー、デフォルトでheadless）
         """
         self.root_url = url
@@ -245,8 +245,6 @@ class ShallowResearcher:
         self.rate_limit = rate_limit
         self.verbose = verbose
         self.force_rerun = force_rerun
-        self.restrict_path = restrict_path  # パス制限設定を保存
-        self.root_path = urlparse(url).path  # ルートURLのパスを保存
         # デフォルトのPlaywright MCPサーバー（ヘッドレスモード）
         self.mcp_server_url = mcp_server_url if mcp_server_url is not None else "npx @playwright/mcp@latest --headless --browser chromium"
         self.site_map = {}
@@ -257,6 +255,12 @@ class ShallowResearcher:
         
         # コンソール出力
         self.console = Console()
+        
+        # LangChainのデバッグモードを設定
+        if self.verbose:
+            set_debug(True)
+            if self.verbose:
+                self.console.print("[yellow]LangChainデバッグモードを有効にしました[/]")
         
         # LLMプロバイダの決定（自動検出または指定）
         if llm_provider:
@@ -398,24 +402,6 @@ class ShallowResearcher:
             tool_names = [tool.name for tool in mcp_tools]
             self.console.print(f"[cyan]利用可能なMCPツール: {', '.join(tool_names)}[/]")
     
-    def _should_include_url(self, url: str) -> bool:
-        """
-        URLが処理対象に含めるべきかどうかを判定する
-        
-        Args:
-            url: チェックするURL
-            
-        Returns:
-            bool: URLを含めるべきかどうか
-        """
-        if not self.restrict_path:
-            return True
-            
-        parsed_url = urlparse(url)
-        url_path = parsed_url.path
-        
-        # ルートURLのパスで始まるURLのみを含める
-        return url_path.startswith(self.root_path)
 
     async def debug_mcp_tools(self) -> None:
         """
@@ -571,35 +557,77 @@ class ShallowResearcher:
         if self.verbose:
             self.console.print(f"[cyan]MCPエージェントでサイトマップ抽出を開始: {self.root_url}[/]")
         
-        # 改良されたプロンプト（より具体的で構造化された指示）
-        question = f"""ウェブサイト {self.root_url} からナビゲーションリンクを抽出してサイトマップを作成してください。
+        # 改良されたプロンプト（より具体的で網羅性を重視した指示）
+        question = f"""ウェブサイト {self.root_url} から可能な限り多くのナビゲーションリンクを抽出してサイトマップを作成してください。
 
 具体的な手順:
-1. playwright_goto_page ツールを使用してページに移動
-2. playwright_get_element_info または playwright_evaluate を使用して以下のセレクタからリンクを抽出:
-   - nav a[href] (ナビゲーション内のリンク)
-   - .nav a[href], .navigation a[href] (ナビゲーションクラス内のリンク)
-   - header a[href] (ヘッダー内のリンク)
-   - .menu a[href], .main-menu a[href] (メニュー内のリンク)
-3. 各リンクのhref属性とテキスト内容を取得
-4. 同じドメイン内のHTTPSリンクのみを対象とし、以下を除外:
-   - アンカーリンク (#で始まる)
-   - JavaScriptリンク (javascript:で始まる)
-   - ファイルリンク (.pdf, .jpg, .png等で終わる)
-   - mailto:リンク
 
-結果を以下の厳密なJSON形式で返してください（他のテキストは含めないでください）:
+**ステップ1: ページに移動**
+1. browser_navigate ツールを使用してページに移動
+
+**ステップ2: ページスナップショットを取得**
+2. browser_snapshot ツールでページ構造を確認
+
+**ステップ3: 段階的リンク抽出（以下の順序で実行）**
+
+A. メインナビゲーション要素から抽出:
+   - nav a[href]
+   - [role="navigation"] a[href]
+   - .navbar a[href], .nav a[href], .navigation a[href]
+   - header nav a[href], header a[href]
+   - .header a[href], #header a[href]
+
+B. メニュー要素から抽出:
+   - .menu a[href], .main-menu a[href], .primary-menu a[href]
+   - .sidebar a[href], .side-nav a[href]
+   - .dropdown a[href], .dropdown-menu a[href]
+   - ul.menu a[href], ol.menu a[href]
+
+C. フッター領域から抽出:
+   - footer a[href], .footer a[href], #footer a[href]
+   - .footer-links a[href], .footer-nav a[href]
+
+D. ドキュメント・コンテンツ領域から抽出:
+   - .toc a[href], .table-of-contents a[href] (目次)
+   - .breadcrumb a[href], .breadcrumbs a[href] (パンくず)
+   - .docs-nav a[href], .documentation-nav a[href]
+   - .sitemap a[href], .site-map a[href]
+   - main a[href], article a[href], .content a[href]
+
+E. 一般的なリンクから抽出:
+   - すべてのa[href]要素を取得し、上記で見つからなかった追加リンクを探す
+
+**ステップ4: リンクのフィルタリング**
+各段階で以下の条件でフィルタリング:
+- 同じドメイン内のHTTPSリンクのみ
+- 以下を除外:
+  - アンカーリンク (#で始まる)
+  - JavaScriptリンク (javascript:で始まる)
+  - ファイルリンク (.pdf, .jpg, .png, .gif, .zip, .doc, .docx等で終わる)
+  - mailto:, tel:, ftp:リンク
+  - 画像ファイル (.svg, .webp等も含む)
+
+**ステップ5: 結果の統合**
+すべての段階で見つかったリンクを統合し、重複を除去
+
+結果を以下の厳密なJSON形式で返してください:
 
 ```json
 {{
   "sitemap": {{
     "https://example.com/page1": "Page 1 Title",
-    "https://example.com/page2": "Page 2 Title"
+    "https://example.com/page2": "Page 2 Title",
+    "https://example.com/about": "About Us",
+    "https://example.com/contact": "Contact"
   }}
 }}
 ```
 
-重要: 応答にはJSON以外の説明やコメントを含めないでください。"""
+**重要な注意事項:**
+- 可能な限り多くのリンクを見つけることが目標です
+- 各段階を順次実行し、見逃しを防いでください
+- リンクのテキストが空の場合は、href属性から適切なタイトルを推測してください
+- 応答にはJSON以外の説明やコメントを含めないでください"""
         
         try:
             result = await self.mcp_agent.ainvoke({
@@ -633,8 +661,7 @@ class ShallowResearcher:
                     filtered_sitemap = {}
                     for url, title in sitemap_data.items():
                         if isinstance(url, str) and isinstance(title, str):
-                            if self._should_include_url(url):
-                                filtered_sitemap[url] = title
+                            filtered_sitemap[url] = title
                     
                     if filtered_sitemap:
                         if self.verbose:
@@ -684,7 +711,6 @@ class ShallowResearcher:
                 try:
                     parsed = urlparse(url)
                     if (parsed.netloc == base_netloc and 
-                        self._should_include_url(url) and
                         not url.endswith(('.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.pdf'))):
                         valid_urls.append(url)
                 except Exception:
@@ -712,80 +738,88 @@ class ShallowResearcher:
         return {}
     
     
-    async def extract_content(self, page: Page) -> Dict[str, Any]:
+    async def extract_content_http(self, url: str) -> Dict[str, Any]:
         """
-        ページからコンテンツを抽出する
+        HTTP GETでページからコンテンツを抽出する
         
         Args:
-            page: Playwrightのページオブジェクト
+            url: ページのURL
             
         Returns:
             抽出したコンテンツの辞書
         """
-        # メインコンテンツエリアのセレクタ
-        main_selectors = [
-            # 標準的なコンテンツエリア
-            "main", 
-            "article", 
-            ".content", 
-            "#content", 
-            ".main-content",
-            
-            # ドキュメントサイト特有のセレクタ
-            ".documentation",
-            ".docs-content",
-            ".markdown-body",
-            ".mdx-content",
-            ".prose",
-            "[role=main]",
-            ".main-docs-content",
-            
-            # MDXやGatsbyなどで一般的に使用されるクラス
-            ".mdx-wrapper",
-            ".gatsby-content",
-            ".docs-wrapper",
-            ".docs-container",
-            
-            # APIドキュメント特有のセレクタ
-            ".api-content",
-            ".api-documentation",
-            ".reference-content",
-            
-            # フォールバック用の広範なセレクタ
-            "[class*='content']",
-            "[class*='documentation']",
-            "[class*='markdown']"
-        ]
-        
-        content = ""
-        title = await page.title()
-        url = page.url
-        
-        # メインコンテンツエリアの検出
-        for selector in main_selectors:
-            try:
-                main_element = await page.query_selector(selector)
-                if main_element:
-                    content = await main_element.inner_text()
-                    break
-            except Exception:
-                continue
-        
-        # メインコンテンツが見つからない場合、bodyから抽出
-        if not content:
-            try:
-                body = await page.query_selector("body")
-                if body:
-                    content = await body.inner_text()
-            except Exception as e:
-                if self.verbose:
-                    self.console.print(f"[yellow]警告: コンテンツ抽出中にエラーが発生しました: {e}[/]")
-        
-        return {
-            "title": title,
-            "url": url,
-            "content": content,
-        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"HTTP {response.status}: {url}")
+                
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # タイトルを取得
+                title_tag = soup.find('title')
+                title = title_tag.get_text().strip() if title_tag else "Untitled"
+                
+                # メインコンテンツエリアのセレクタ
+                main_selectors = [
+                    # 標準的なコンテンツエリア
+                    "main", 
+                    "article", 
+                    ".content", 
+                    "#content", 
+                    ".main-content",
+                    
+                    # ドキュメントサイト特有のセレクタ
+                    ".documentation",
+                    ".docs-content",
+                    ".markdown-body",
+                    ".mdx-content",
+                    ".prose",
+                    "[role=main]",
+                    ".main-docs-content",
+                    
+                    # MDXやGatsbyなどで一般的に使用されるクラス
+                    ".mdx-wrapper",
+                    ".gatsby-content",
+                    ".docs-wrapper",
+                    ".docs-container",
+                    
+                    # APIドキュメント特有のセレクタ
+                    ".api-content",
+                    ".api-documentation",
+                    ".reference-content",
+                ]
+                
+                content = ""
+                
+                # メインコンテンツエリアの検出
+                for selector in main_selectors:
+                    try:
+                        main_element = soup.select_one(selector)
+                        if main_element:
+                            content = main_element.get_text(separator='\n', strip=True)
+                            break
+                    except Exception:
+                        continue
+                
+                # メインコンテンツが見つからない場合、bodyから抽出
+                if not content:
+                    try:
+                        body = soup.find('body')
+                        if body:
+                            # スクリプトとスタイルタグを除去
+                            for script in body(["script", "style"]):
+                                script.extract()
+                            content = body.get_text(separator='\n', strip=True)
+                    except Exception as e:
+                        if self.verbose:
+                            self.console.print(f"[yellow]警告: コンテンツ抽出中にエラーが発生しました: {e}[/]")
+                
+                return {
+                    "title": title,
+                    "url": url,
+                    "content": content,
+                }
     async def summarize_page(self, url: str, task_id: Optional[TaskID] = None, progress: Optional[Progress] = None) -> Dict[str, Any]:
         """
         ページを要約する
@@ -809,39 +843,33 @@ class ShallowResearcher:
             retries = 0
             while retries < MAX_RETRIES:
                 try:
-                    async with async_playwright() as p:
-                        browser = await p.chromium.launch(headless=True)
-                        page = await browser.new_page()
-                        await page.goto(url, wait_until="networkidle")
-                        
-                        # コンテンツ抽出
-                        page_data = await self.extract_content(page)
-                        await browser.close()
-                        
-                        # 要約生成
-                        if progress and task_id:
-                            progress.update(task_id, description=f"要約生成中: {url}")
-                        
-                        # コンテンツが短すぎる場合はそのまま返す
-                        if len(page_data["content"]) < 100:
-                            summary = f"# {page_data['title']}\n\nこのページには十分なコンテンツがありません。"
-                        else:
-                            summary = await self.summary_chain.ainvoke({
-                                "title": page_data["title"],
-                                "url": url,
-                                "content": page_data["content"]
-                            })
-                        
-                        result = {
+                    # HTTP GETでコンテンツ抽出
+                    page_data = await self.extract_content_http(url)
+                    
+                    # 要約生成
+                    if progress and task_id:
+                        progress.update(task_id, description=f"要約生成中: {url}")
+                    
+                    # コンテンツが短すぎる場合はそのまま返す
+                    if len(page_data["content"]) < 100:
+                        summary = f"# {page_data['title']}\n\nこのページには十分なコンテンツがありません。"
+                    else:
+                        summary = await self.summary_chain.ainvoke({
                             "title": page_data["title"],
                             "url": url,
-                            "summary": summary
-                        }
-                        
-                        if progress is not None and task_id is not None:
-                            progress.update(task_id, description=f"完了: {url}", completed=True)
-                        
-                        return result
+                            "content": page_data["content"]
+                        })
+                    
+                    result = {
+                        "title": page_data["title"],
+                        "url": url,
+                        "summary": summary
+                    }
+                    
+                    if progress is not None and task_id is not None:
+                        progress.update(task_id, description=f"完了: {url}", completed=True)
+                    
+                    return result
                 
                 except Exception as e:
                     retries += 1
@@ -935,26 +963,21 @@ class ShallowResearcher:
             # サイトマップの取得
             sitemap_task = progress.add_task("[cyan]サイトマップを取得中...", total=1)
             
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
+            try:
+                # HTTP GETでルートページのタイトルを取得
+                root_page_data = await self.extract_content_http(self.root_url)
+                root_title = root_page_data["title"]
                 
-                try:
-                    await page.goto(self.root_url, wait_until="networkidle")
-                    # ルートページのタイトルを取得
-                    root_title = await page.title()
-                    await browser.close()
-                    
-                    # MCPを使用してサイトマップを抽出（現在はフォールバック）
-                    self.site_map = await self.extract_sitemap_with_mcp()
-                    
-                    # ルートページも追加
-                    self.site_map[self.root_url] = root_title
-                    
-                    progress.update(sitemap_task, completed=True, description=f"サイトマップ取得完了: {len(self.site_map)}ページ")
-                except Exception as e:
-                    progress.update(sitemap_task, completed=True, description=f"[red]サイトマップ取得エラー: {e}[/]")
-                    return
+                # MCPを使用してサイトマップを抽出
+                self.site_map = await self.extract_sitemap_with_mcp()
+                
+                # ルートページも追加
+                self.site_map[self.root_url] = root_title
+                
+                progress.update(sitemap_task, completed=True, description=f"サイトマップ取得完了: {len(self.site_map)}ページ")
+            except Exception as e:
+                progress.update(sitemap_task, completed=True, description=f"[red]サイトマップ取得エラー: {e}[/]")
+                return
             
             # 前回のサイトマップを読み込み
             previous_sitemap = self._load_previous_sitemap()
@@ -1214,7 +1237,6 @@ def main():
     parser.add_argument("-f", "--force", action="store_true", help="すべてのページを強制的に再実行")
     parser.add_argument("--final-only", action="store_true", help="最終要約のみを生成")
     parser.add_argument("--mcp-debug", action="store_true", help="MCPツールのデバッグテストのみを実行")
-    parser.add_argument("--restrict-path", action="store_true", default=True, help="ルートURLのパスに基づいてURLを制限する")
     
     # MCP関連のオプション
     parser.add_argument("--mcp-server-url", help="MCPサーバーのコマンド（デフォルト: npx @playwright/mcp@latest --headless）")
@@ -1246,7 +1268,6 @@ def main():
         api_key=args.api_key,
         verbose=args.verbose,
         force_rerun=args.force,
-        restrict_path=args.restrict_path,
         mcp_server_url=args.mcp_server_url,
         **kwargs  # OpenAI互換サービスの設定を追加
     )
